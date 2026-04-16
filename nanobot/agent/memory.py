@@ -220,11 +220,17 @@ class MemoryStore:
 
     # -- history.jsonl — append-only, JSONL format ---------------------------
 
-    def append_history(self, entry: str) -> int:
+    def append_history(self, entry: str, metadata: dict[str, Any] | None = None) -> int:
         """Append *entry* to history.jsonl and return its auto-incrementing cursor."""
         cursor = self._next_cursor()
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        record = {"cursor": cursor, "timestamp": ts, "content": strip_think(entry.rstrip()) or entry.rstrip()}
+        record: dict[str, Any] = {
+            "cursor": cursor,
+            "timestamp": ts,
+            "content": strip_think(entry.rstrip()) or entry.rstrip(),
+        }
+        if metadata:
+            record["metadata"] = metadata
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._cursor_file.write_text(str(cursor), encoding="utf-8")
@@ -326,11 +332,12 @@ class MemoryStore:
             )
         return "\n".join(lines)
 
-    def raw_archive(self, messages: list[dict]) -> None:
+    def raw_archive(self, messages: list[dict], metadata: dict[str, Any] | None = None) -> None:
         """Fallback: dump raw messages to history.jsonl without LLM summarization."""
         self.append_history(
             f"[RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
+            f"{self._format_messages(messages)}",
+            metadata=metadata,
         )
         logger.warning(
             "Memory consolidation degraded: raw-archived {} messages", len(messages)
@@ -433,13 +440,23 @@ class Consolidator:
             self._get_tool_definitions(),
         )
 
-    async def archive(self, messages: list[dict]) -> str | None:
+    async def archive(self, messages: list[dict], session: Session | None = None) -> str | None:
         """Summarize messages via LLM and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
         """
         if not messages:
             return None
+        metadata: dict[str, Any] | None = None
+        if session:
+            metadata = {}
+            if session.key:
+                metadata["session_key"] = session.key
+            task_id = session.metadata.get("task_id") if session.metadata else None
+            if task_id:
+                metadata["task_id"] = task_id
+            if not metadata:
+                metadata = None
         try:
             formatted = MemoryStore._format_messages(messages)
             response = await self.provider.chat_with_retry(
@@ -458,11 +475,11 @@ class Consolidator:
                 tool_choice=None,
             )
             summary = response.content or "[no summary]"
-            self.store.append_history(summary)
+            self.store.append_history(summary, metadata=metadata)
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, raw-dumping to history")
-            self.store.raw_archive(messages)
+            self.store.raw_archive(messages, metadata=metadata)
             return None
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
@@ -533,7 +550,7 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                if not await self.archive(chunk):
+                if not await self.archive(chunk, session=session):
                     return
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
@@ -568,6 +585,7 @@ class Dream:
         max_batch_size: int = 20,
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
+        task_store: Any | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -575,6 +593,7 @@ class Dream:
         self.max_batch_size = max_batch_size
         self.max_iterations = max_iterations
         self.max_tool_result_chars = max_tool_result_chars
+        self.task_store = task_store
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -665,10 +684,31 @@ class Dream:
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )
 
+        # Build task context from entries that carry a task_id
+        task_context_parts: list[str] = []
+        task_ids_in_batch: set[str] = set()
+        for e in batch:
+            meta = e.get("metadata") or {}
+            tid = meta.get("task_id")
+            if tid:
+                task_ids_in_batch.add(tid)
+        if self.task_store and task_ids_in_batch:
+            for tid in sorted(task_ids_in_batch):
+                summary = self.task_store.build_task_summary(tid)
+                if summary:
+                    task_context_parts.append(f"## Task {tid}\n{summary}")
+                mem = self.task_store.build_task_memory_context(tid)
+                if mem:
+                    task_context_parts.append(mem)
+        task_context = "\n\n".join(task_context_parts) if task_context_parts else ""
+
         # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
         phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
+            f"## Conversation History\n{history_text}\n\n"
+            f"{file_context}"
         )
+        if task_context:
+            phase1_prompt += f"\n\n## Active Task Context\n{task_context}"
 
         try:
             phase1_response = await self.provider.chat_with_retry(
@@ -689,6 +729,30 @@ class Dream:
             logger.exception("Dream Phase 1 failed")
             return False
 
+        # Parse task-memory lines and persist them before Phase 2
+        task_memory_changelog: list[str] = []
+        if self.task_store:
+            task_memory_pattern = re.compile(r"^\[TASK:([^\]]+)\]\s*(.*)$")
+            filtered_lines: list[str] = []
+            task_facts: dict[str, list[str]] = {}
+            for line in analysis.splitlines():
+                m = task_memory_pattern.match(line.strip())
+                if m:
+                    tid, fact = m.group(1).strip(), m.group(2).strip()
+                    if tid and fact:
+                        task_facts.setdefault(tid, []).append(fact)
+                else:
+                    filtered_lines.append(line)
+            for tid, facts in task_facts.items():
+                for fact in facts:
+                    if self.task_store.add_task_memory(tid, fact):
+                        task_memory_changelog.append(f"task_memory_add {tid}: {fact}")
+                    else:
+                        logger.warning("Dream failed to add task memory for {}: {}", tid, fact)
+            filtered_analysis = "\n".join(filtered_lines)
+        else:
+            filtered_analysis = analysis
+
         # Phase 2: Delegate to AgentRunner with read_file / edit_file
         existing_skills = self._list_existing_skills()
         skills_section = ""
@@ -697,7 +761,7 @@ class Dream:
                 "\n\n## Existing Skills\n"
                 + "\n".join(f"- {s}" for s in existing_skills)
             )
-        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}{skills_section}"
+        phase2_prompt = f"## Analysis Result\n{filtered_analysis}\n\n{file_context}{skills_section}"
 
         tools = self._tools
         skill_creator_path = BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"
@@ -738,6 +802,7 @@ class Dream:
             for event in result.tool_events:
                 if event["status"] == "ok":
                     changelog.append(f"{event['name']}: {event['detail']}")
+        changelog.extend(task_memory_changelog)
 
         # Advance cursor — always, to avoid re-processing Phase 1
         new_cursor = batch[-1]["cursor"]

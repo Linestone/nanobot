@@ -28,6 +28,12 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.task_memory import (
+    TaskMemoryAddTool,
+    TaskMemoryDeleteTool,
+    TaskMemoryListTool,
+    TaskMemoryUpdateTool,
+)
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -61,6 +67,7 @@ class _LoopHook(AgentHook):
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        task_id: str | None = None,
     ) -> None:
         super().__init__(reraise=True)
         self._loop = agent_loop
@@ -70,6 +77,7 @@ class _LoopHook(AgentHook):
         self._channel = channel
         self._chat_id = chat_id
         self._message_id = message_id
+        self._task_id = task_id
         self._stream_buf = ""
 
     def wants_streaming(self) -> bool:
@@ -103,7 +111,7 @@ class _LoopHook(AgentHook):
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
-        self._loop._set_tool_context(self._channel, self._chat_id, self._message_id)
+        self._loop._set_tool_context(self._channel, self._chat_id, self._message_id, task_id=self._task_id)
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         u = context.usage or {}
@@ -240,6 +248,7 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            task_store=self.context.task_store,
         )
         self._register_default_tools()
         self.commands = CommandRouter()
@@ -279,6 +288,10 @@ class AgentLoop:
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(TaskMemoryAddTool(self.workspace))
+        self.tools.register(TaskMemoryUpdateTool(self.workspace))
+        self.tools.register(TaskMemoryDeleteTool(self.workspace))
+        self.tools.register(TaskMemoryListTool(self.workspace))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -306,12 +319,25 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                    if name == "message":
+                        tool.set_context(channel, chat_id, message_id)
+                    else:
+                        tool.set_context(channel, chat_id)
+        for name in ("task_memory_add", "task_memory_update", "task_memory_delete", "task_memory_list"):
+            if tool := self.tools.get(name):
+                if hasattr(tool, "set_context"):
+                    tool.set_context(task_id)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -346,6 +372,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         message_id: str | None = None,
+        task_id: str | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
@@ -365,6 +392,7 @@ class AgentLoop:
             channel=channel,
             chat_id=chat_id,
             message_id=message_id,
+            task_id=task_id,
         )
         hook: AgentHook = (
             CompositeHook([loop_hook] + self._extra_hooks) if self._extra_hooks else loop_hook
@@ -631,8 +659,9 @@ class AgentLoop:
 
             session, pending = self.auto_compact.prepare_session(session, key)
 
+            task_id = session.metadata.get("task_id")
             await self.consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), task_id=task_id)
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
 
@@ -641,10 +670,11 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 session_summary=pending,
                 current_role=current_role,
+                task_id=task_id,
             )
             final_content, _, all_msgs, _, _ = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
-                message_id=msg.metadata.get("message_id"),
+                message_id=msg.metadata.get("message_id"), task_id=task_id,
             )
             self._save_turn(session, all_msgs, 1 + len(history))
             self._clear_runtime_checkpoint(session)
@@ -672,17 +702,22 @@ class AgentLoop:
         if self._restore_pending_user_turn(session):
             self.sessions.save(session)
 
+        task_id = session.metadata.get("task_id")
+
         session, pending = self.auto_compact.prepare_session(session, key)
 
         # Slash commands
         raw = msg.content.strip()
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
+            # Re-read task_id: a slash command (e.g. /task attach) may have
+            # mutated session metadata between the read above and here.
+            task_id = session.metadata.get("task_id")
             return result
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), task_id=task_id)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
@@ -696,6 +731,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            task_id=task_id,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -733,6 +769,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             message_id=msg.metadata.get("message_id"),
+            task_id=task_id,
             pending_queue=pending_queue,
         )
 

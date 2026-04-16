@@ -9,6 +9,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.task import TaskTreeStore
 from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
 from nanobot.utils.prompt_templates import render_template
 
@@ -25,12 +26,14 @@ class ContextBuilder:
         self.workspace = workspace
         self.timezone = timezone
         self.memory = MemoryStore(workspace)
+        self.task_store = TaskTreeStore(workspace)
         self.skills = SkillsLoader(workspace, disabled_skills=set(disabled_skills) if disabled_skills else None)
 
     def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
+        task_id: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(channel=channel)]
@@ -38,6 +41,20 @@ class ContextBuilder:
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
+
+        if task_id:
+            task_summary = self.task_store.build_task_summary(task_id)
+            if task_summary:
+                parts.append(f"# Current Task\n\n{task_summary}")
+            task_memory = self.task_store.build_task_memory_context(task_id)
+            if task_memory:
+                parts.append(f"# Current Task Memory\n\n{task_memory}")
+            parts.append(
+                "# Task Memory Tools\n"
+                "If you identify a new stable fact or useful detail for this task, use the available task memory tools. "
+                "Use `task_memory_add` to add a new memory entry, `task_memory_update` to correct an existing entry, "
+                "`task_memory_delete` to remove an outdated entry, and `task_memory_list` to inspect entries."
+            )
 
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
@@ -136,6 +153,7 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         session_summary: str | None = None,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone, session_summary=session_summary)
@@ -148,7 +166,7 @@ class ContextBuilder:
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel, task_id=task_id)},
             *history,
         ]
         if messages[-1].get("role") == current_role:

@@ -5,6 +5,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from nanobot.agent.memory import Consolidator, MemoryStore
+from nanobot.session.manager import Session
 
 
 @pytest.fixture
@@ -125,3 +126,57 @@ class TestConsolidatorTokenBudget:
 
         consolidator.archive.assert_not_awaited()
         assert session.last_consolidated == 0
+
+
+class TestConsolidatorMetadata:
+    async def test_archive_passes_task_id_from_session(self, consolidator, mock_provider, store):
+        """archive() with a session that has task_id should write metadata to history."""
+        mock_provider.chat_with_retry.return_value = MagicMock(content="summary text")
+        session = Session(key="cli:chat1")
+        session.metadata["task_id"] = "task_abc"
+        messages = [{"role": "user", "content": "hi"}]
+
+        await consolidator.archive(messages, session=session)
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert entries[0]["metadata"]["task_id"] == "task_abc"
+        assert entries[0]["metadata"]["session_key"] == "cli:chat1"
+
+    async def test_archive_without_session_has_no_metadata(self, consolidator, mock_provider, store):
+        """archive() with no session should not write metadata."""
+        mock_provider.chat_with_retry.return_value = MagicMock(content="summary")
+        messages = [{"role": "user", "content": "hi"}]
+
+        await consolidator.archive(messages)
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert "metadata" not in entries[0]
+
+    async def test_archive_session_without_task_id_omits_task_id(self, consolidator, mock_provider, store):
+        """Session with no task_id in metadata should not write task_id."""
+        mock_provider.chat_with_retry.return_value = MagicMock(content="summary")
+        session = Session(key="cli:chat2")
+        messages = [{"role": "user", "content": "hi"}]
+
+        await consolidator.archive(messages, session=session)
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        meta = entries[0].get("metadata", {})
+        assert "task_id" not in meta
+
+    async def test_archive_fallback_also_passes_metadata(self, consolidator, mock_provider, store):
+        """On LLM failure, raw_archive should also receive metadata with task_id."""
+        mock_provider.chat_with_retry.side_effect = Exception("API down")
+        session = Session(key="cli:x")
+        session.metadata["task_id"] = "t1"
+        messages = [{"role": "user", "content": "hi"}]
+
+        await consolidator.archive(messages, session=session)
+
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert len(entries) == 1
+        assert "[RAW]" in entries[0]["content"]
+        assert entries[0]["metadata"]["task_id"] == "t1"

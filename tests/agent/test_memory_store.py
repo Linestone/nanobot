@@ -115,6 +115,32 @@ class TestHistoryWithCursor:
         assert entries[0]["cursor"] in {4, 5}
 
 
+class TestHistoryMetadata:
+    def test_append_history_persists_metadata(self, store):
+        store.append_history("hello", metadata={"task_id": "abc", "session_key": "cli:chat1"})
+        line = store.history_file.read_text(encoding="utf-8").strip()
+        record = json.loads(line)
+        assert record["metadata"]["task_id"] == "abc"
+        assert record["metadata"]["session_key"] == "cli:chat1"
+
+    def test_append_history_without_metadata_has_no_metadata_field(self, store):
+        store.append_history("hello")
+        line = store.history_file.read_text(encoding="utf-8").strip()
+        record = json.loads(line)
+        assert "metadata" not in record
+
+    def test_append_history_empty_metadata_has_no_metadata_field(self, store):
+        store.append_history("hello", metadata={})
+        line = store.history_file.read_text(encoding="utf-8").strip()
+        record = json.loads(line)
+        assert "metadata" not in record
+
+    def test_read_unprocessed_history_preserves_metadata(self, store):
+        store.append_history("fact", metadata={"task_id": "t1"})
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert entries[0]["metadata"]["task_id"] == "t1"
+
+
 class TestDreamCursor:
     def test_initial_cursor_is_zero(self, store):
         assert store.get_last_dream_cursor() == 0

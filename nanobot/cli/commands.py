@@ -227,7 +227,20 @@ def _is_exit_command(command: str) -> bool:
     return command.lower() in EXIT_COMMANDS
 
 
-async def _read_interactive_input_async() -> str:
+def _build_prompt_html(session_label: str, task_title: str | None) -> HTML:
+    """Build the interactive prompt showing optional task context and session label."""
+    def _esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    parts: list[str] = []
+    if task_title:
+        parts.append(f"<ansigreen>({_esc(task_title)})</ansigreen> ")
+    parts.append(f"<ansigray>[{_esc(session_label)}]</ansigray> ")
+    parts.append("<b fg='ansiblue'>You:</b> ")
+    return HTML("".join(parts))
+
+
+async def _read_interactive_input_async(prompt: HTML | None = None) -> str:
     """Read user input using prompt_toolkit (handles paste, history, display).
 
     prompt_toolkit natively handles:
@@ -240,7 +253,7 @@ async def _read_interactive_input_async() -> str:
     try:
         with patch_stdout():
             return await _PROMPT_SESSION.prompt_async(
-                HTML("<b fg='ansiblue'>You:</b> "),
+                prompt if prompt is not None else HTML("<b fg='ansiblue'>You:</b> "),
             )
     except EOFError as exc:
         raise KeyboardInterrupt from exc
@@ -1037,6 +1050,10 @@ def agent(
             turn_response: list[tuple[str, dict]] = []
             renderer: StreamRenderer | None = None
 
+            # Mutable current session key — updated by _session_switch signals.
+            # Using a list so the closure in _consume_outbound can mutate it.
+            _current_session_key: list[str] = [f"{cli_channel}:{cli_chat_id}"]
+
             async def _consume_outbound():
                 while True:
                     try:
@@ -1067,6 +1084,11 @@ def agent(
                                 await _print_interactive_progress_line(msg.content, _thinking)
                             continue
 
+                        # Handle session switch signal from commands like /task attach
+                        new_key = msg.metadata.get("_session_switch") if msg.metadata else None
+                        if new_key:
+                            _current_session_key[0] = new_key
+
                         if not turn_done.is_set():
                             if msg.content:
                                 turn_response.append((msg.content, dict(msg.metadata or {})))
@@ -1092,7 +1114,19 @@ def agent(
                         # Stop spinner before user input to avoid prompt_toolkit conflicts
                         if renderer:
                             renderer.stop_for_input()
-                        user_input = await _read_interactive_input_async()
+
+                        # Build dynamic prompt showing current session + task context
+                        _cur_key = _current_session_key[0]
+                        _session_label = _cur_key.split(":", 1)[-1] if ":" in _cur_key else _cur_key
+                        _session = agent_loop.sessions.get_or_create(_cur_key)
+                        _task_id = _session.metadata.get("task_id")
+                        _task_title: str | None = None
+                        if _task_id:
+                            _task = agent_loop.context.task_store.get_task(_task_id)
+                            if _task:
+                                _task_title = _task.title
+                        _prompt = _build_prompt_html(_session_label, _task_title)
+                        user_input = await _read_interactive_input_async(_prompt)
                         command = user_input.strip()
                         if not command:
                             continue
@@ -1106,12 +1140,20 @@ def agent(
                         turn_response.clear()
                         renderer = StreamRenderer(render_markdown=markdown)
 
+                        _cur_key = _current_session_key[0]
+                        _cur_channel, _cur_chat_id = (
+                            _cur_key.split(":", 1) if ":" in _cur_key else (cli_channel, _cur_key)
+                        )
                         await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
+                            channel=_cur_channel,
                             sender_id="user",
-                            chat_id=cli_chat_id,
+                            chat_id=_cur_chat_id,
                             content=user_input,
-                            metadata={"_wants_stream": True},
+                            session_key_override=_cur_key,
+                            metadata={
+                                "_wants_stream": True,
+                                "_current_session_key": _cur_key,
+                            },
                         ))
 
                         await turn_done.wait()

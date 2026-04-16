@@ -4,13 +4,17 @@ Output one line per finding:
 [FILE] atomic fact (not already in memory)
 [FILE-REMOVE] reason for removal
 [SKILL] kebab-case-name: one-line description of the reusable pattern
+[TASK:<task_id>] atomic fact specific to that task (not already in task memory)
 
 Files: USER (identity, preferences), SOUL (bot behavior, tone), MEMORY (knowledge, project context)
+Task memory: task-specific facts, requirements, or progress tied to a particular task
 
 Rules:
 - Atomic facts: "has a cat named Luna" not "discussed pet care"
 - Corrections: [USER] location is Tokyo, not Osaka
 - Capture confirmed approaches the user validated
+- Task facts: only output [TASK:<id>] when the fact is clearly scoped to that task and would not be useful outside of it
+- Global facts: output [USER]/[MEMORY] for preferences, system info, or cross-task knowledge
 
 Staleness — flag for [FILE-REMOVE]:
 - Time-sensitive data older than 14 days: weather, daily status, one-time meetings, passed events
