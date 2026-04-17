@@ -150,6 +150,7 @@ class TestMessageToolSuppressLogic:
         assert progress == [
             ("Visible", False),
             ('read foo.txt', True),
+            ('✗ Error: File not found: foo.txt', True),
         ]
 
 

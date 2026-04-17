@@ -5,6 +5,13 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Any
+
+try:
+    import yaml as _yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
@@ -165,8 +172,14 @@ class SkillsLoader:
             return content[match.end():].strip()
         return content
 
-    def _parse_nanobot_metadata(self, raw: str) -> dict:
-        """Parse skill metadata JSON from frontmatter (supports nanobot and openclaw keys)."""
+    def _parse_nanobot_metadata(self, raw: Any) -> dict:
+        """Parse skill metadata from frontmatter (supports nanobot/openclaw JSON string or plain YAML dict)."""
+        if isinstance(raw, dict):
+            # Multi-line YAML dict (lark-cli skills format): use directly, or unwrap "nanobot" key if present
+            payload = raw.get("nanobot", raw.get("openclaw", raw))
+            return payload if isinstance(payload, dict) else {}
+        if not raw:
+            return {}
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -218,8 +231,17 @@ class SkillsLoader:
         match = _STRIP_SKILL_FRONTMATTER.match(content)
         if not match:
             return None
-        metadata: dict[str, str] = {}
-        for line in match.group(1).splitlines():
+        frontmatter_text = match.group(1)
+        if _YAML_AVAILABLE:
+            try:
+                parsed = _yaml.safe_load(frontmatter_text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except _yaml.YAMLError:
+                pass
+        # Fallback: simple line-by-line parser for single-line key: value pairs
+        metadata: dict[str, Any] = {}
+        for line in frontmatter_text.splitlines():
             if ":" not in line:
                 continue
             key, value = line.split(":", 1)

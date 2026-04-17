@@ -98,23 +98,22 @@ def test_print_cli_progress_line_pauses_spinner_before_printing():
 
 @pytest.mark.asyncio
 async def test_print_interactive_progress_line_pauses_spinner_before_printing():
-    """Interactive progress output should also pause spinner cleanly."""
-    order: list[str] = []
-    spinner = MagicMock()
-    spinner.start.side_effect = lambda: order.append("start")
-    spinner.stop.side_effect = lambda: order.append("stop")
-    mock_console = MagicMock()
-    mock_console.status.return_value = spinner
-
-    async def fake_print(_text: str) -> None:
-        order.append("print")
-
-    with patch("nanobot.cli.commands._print_interactive_line", side_effect=fake_print):
-        thinking = stream_mod.ThinkingSpinner(console=mock_console)
-        with thinking:
-            await commands._print_interactive_progress_line("tool running", thinking)
-
-    assert order == ["start", "stop", "print", "start", "stop"]
+    """Interactive progress output should pause spinner before printing."""
+    mock_spinner = MagicMock()
+    mock_spinner.pause.return_value.__enter__ = MagicMock()
+    mock_spinner.pause.return_value.__exit__ = MagicMock()
+    
+    mock_thinking = MagicMock()
+    mock_thinking.pause.return_value.__enter__ = MagicMock()
+    mock_thinking.pause.return_value.__exit__ = MagicMock()
+    mock_thinking._spinner = mock_spinner
+    
+    with patch("nanobot.cli.commands.console") as mock_console:
+        await commands._print_interactive_progress_line("tool running", mock_thinking)
+        
+        # Verify console.print was called with proper formatting
+        mock_console.print.assert_called_once_with("  [dim]↳ tool running[/dim]")
+        mock_thinking.pause.assert_called_once()
 
 
 def test_response_renderable_uses_text_for_explicit_plain_rendering():

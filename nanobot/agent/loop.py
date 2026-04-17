@@ -121,6 +121,12 @@ class _LoopHook(AgentHook):
             u.get("completion_tokens", 0),
             u.get("cached_tokens", 0),
         )
+        if self._on_progress and context.tool_results and context.tool_calls:
+            from nanobot.utils.tool_hints import format_tool_result
+            for tool_call, result in zip(context.tool_calls, context.tool_results):
+                hint = format_tool_result(tool_call.name, result)
+                if hint:
+                    await self._on_progress(hint, tool_hint=True)
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return self._loop._strip_think(content)

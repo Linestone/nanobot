@@ -199,7 +199,7 @@ class ExecTool(Tool):
             )
         bash = shutil.which("bash") or "/bin/bash"
         return await asyncio.create_subprocess_exec(
-            bash, "-l", "-c", command,
+            bash, "-c", command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
@@ -260,6 +260,11 @@ class ExecTool(Tool):
             "HOME": home,
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": os.environ.get("TERM", "dumb"),
+            # Inherit PATH from the parent process so that tools installed via
+            # version managers (fnm, nvm, pyenv, rbenv, etc.) are reachable.
+            # bash -l would reset PATH via /etc/profile on macOS, so we drop
+            # the -l flag in _spawn() and rely on this inherited value instead.
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
         }
         for key in self.allowed_env_keys:
             val = os.environ.get(key)

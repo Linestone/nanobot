@@ -219,7 +219,7 @@ def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> Non
 async def _print_interactive_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
     """Print an interactive progress line, pausing the spinner if needed."""
     with thinking.pause() if thinking else nullcontext():
-        await _print_interactive_line(text)
+        console.print(f"  [dim]↳ {text}[/dim]")
 
 
 def _is_exit_command(command: str) -> bool:
@@ -1081,7 +1081,8 @@ def agent(
                             elif ch and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
-                                await _print_interactive_progress_line(msg.content, _thinking)
+                                spinner = renderer._spinner if renderer else None
+                                await _print_interactive_progress_line(msg.content, spinner)
                             continue
 
                         # Handle session switch signal from commands like /task attach

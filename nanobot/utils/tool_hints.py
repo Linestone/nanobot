@@ -92,7 +92,7 @@ def _fmt_known(tc, fmt: tuple) -> str:
     return fmt[1].format(val)
 
 
-def _abbreviate_command(cmd: str, max_len: int = 40) -> str:
+def _abbreviate_command(cmd: str, max_len: int = 80) -> str:
     """Abbreviate paths in a command string, then truncate."""
     def _replace_path(match: re.Match[str]) -> str:
         if match.group("double") is not None:
@@ -135,3 +135,30 @@ def _fmt_fallback(tc) -> str:
     if not isinstance(val, str):
         return tc.name
     return f'{tc.name}("{abbreviate_path(val, 40)}")' if len(val) > 40 else f'{tc.name}("{val}")'
+
+
+def format_tool_result(tool_name: str, result: object) -> str:
+    """Format a brief result indicator for a completed tool call.
+
+    Returns a short string like "✓ exit 0" or "✗ exit 1: error message".
+    Returns empty string if result is not worth showing.
+    """
+    result_str = str(result) if result is not None else ""
+
+    if tool_name == "exec":
+        import re as _re
+        m = _re.search(r"Exit code:\s*(-?\d+)", result_str)
+        code = int(m.group(1)) if m else None
+        if code is not None:
+            lines = [l.strip() for l in result_str.splitlines() if l.strip() and "Exit code:" not in l and "STDERR:" not in l]
+            detail = lines[0][:80] if lines else ""
+            mark = "\u2713" if code == 0 else "\u2717"
+            base = f"{mark} exit {code}"
+            return base + (f": {detail}" if detail else "")
+        return ""
+
+    # Generic tools: detect errors
+    if result_str.startswith("Error:"):
+        first_line = result_str.split("\n")[0]
+        return f"\u2717 {first_line[:60]}"
+    return "\u2713"

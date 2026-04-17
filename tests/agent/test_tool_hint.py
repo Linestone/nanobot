@@ -50,7 +50,7 @@ class TestToolHintKnownTools:
         cmd = "cd /very/long/path && cat file && echo done && sleep 1 && ls -la"
         result = _hint([_tc("exec", {"command": cmd})])
         assert result.startswith("$ ")
-        assert len(result) <= 50  # reasonable limit
+        assert len(result) <= 100  # reasonable limit
 
     def test_exec_abbreviates_paths_in_command(self):
         """Windows paths in exec commands should be folded, not blindly truncated."""

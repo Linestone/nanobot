@@ -27,7 +27,7 @@ class TestBuildEnvUnix:
     def test_expected_keys(self):
         with patch("nanobot.agent.tools.shell._IS_WINDOWS", False):
             env = ExecTool()._build_env()
-        expected = {"HOME", "LANG", "TERM"}
+        expected = {"HOME", "LANG", "TERM", "PATH"}
         assert expected <= set(env)
         if sys.platform != "win32":
             assert set(env) == expected
@@ -104,7 +104,7 @@ class TestSpawnUnix:
 
         args = mock_exec.call_args[0]
         assert "bash" in args[0]
-        assert "-l" in args
+        assert "-l" not in args
         assert "-c" in args
         assert "echo hi" in args
 
