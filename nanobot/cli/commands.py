@@ -240,6 +240,121 @@ def _build_prompt_html(session_label: str, task_title: str | None) -> HTML:
     return HTML("".join(parts))
 
 
+async def _run_arrow_picker(title: str, items: list[tuple[str, str]]) -> str | None:
+    """Arrow-key list picker using prompt_toolkit Application. Returns selected value or None if cancelled."""
+    from prompt_toolkit import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.styles import Style
+
+    selected = [0]
+    result = [None]
+
+    def get_tokens():
+        out: list[tuple[str, str]] = []
+        out.append(("class:title", f"\n  {title}\n\n"))
+        for i, (_, label) in enumerate(items):
+            if i == selected[0]:
+                out.append(("class:selected", f"  ▶  {label}\n"))
+            else:
+                out.append(("", f"     {label}\n"))
+        out.append(("class:footer", "\n  ↑↓ 移动   Enter 确认   Ctrl+C 取消\n"))
+        return out
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        selected[0] = (selected[0] - 1) % len(items)
+        event.app.invalidate()
+
+    @kb.add("down")
+    def _(event):
+        selected[0] = (selected[0] + 1) % len(items)
+        event.app.invalidate()
+
+    @kb.add("enter")
+    def _(event):
+        result[0] = items[selected[0]][0]
+        event.app.exit()
+
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit()
+
+    control = FormattedTextControl(get_tokens, focusable=True, show_cursor=False)
+    layout = Layout(Window(content=control))
+    style = Style.from_dict({"title": "bold", "selected": "bold ansicyan", "footer": "ansigray"})
+    app = Application(layout=layout, key_bindings=kb, style=style, mouse_support=False)
+    await app.run_async()
+    return result[0]
+
+
+async def _pick_task_tui(workspace) -> str | None:
+    """TUI task picker for new session. Returns task_id or None. Skipped if no active tasks."""
+    from nanobot.task.store import TaskTreeStore
+
+    store = TaskTreeStore(workspace)
+    active = [t for t in store.list_tasks() if t.status in ("todo", "in_progress")]
+    if not active:
+        return None
+
+    items = [("__none__", "[ 不关联任务 ]")]
+    for t in active:
+        items.append((t.id, f"{t.title}  ({t.id})"))
+
+    selected = await _run_arrow_picker(f"{__logo__} 关联任务（可选）", items)
+    return None if selected in (None, "__none__") else selected
+
+
+async def _pick_session_tui(agent_loop) -> str:
+    """TUI session picker. Returns the session key to use (existing or newly created)."""
+    import uuid
+    from nanobot.task.store import TaskTreeStore
+
+    sessions_mgr = agent_loop.sessions
+    all_sessions = sessions_mgr.list_sessions()
+
+    if not all_sessions:
+        # No existing sessions — create new directly without showing picker
+        short_id = uuid.uuid4().hex[:8]
+        new_key = f"cli:{short_id}"
+        session = sessions_mgr.get_or_create(new_key)
+        session.title = f"会话 {short_id}"
+        sessions_mgr.save(session)
+        return new_key
+
+    items = [("__new__", "[ 新会话 ]")]
+    task_store = TaskTreeStore(agent_loop.workspace)
+    for info in all_sessions:
+        key = info["key"]
+        title = info.get("title") or key.split(":", 1)[-1]
+        s = sessions_mgr.get_or_create(key)
+        task_id = s.metadata.get("task_id")
+        task_suffix = ""
+        if task_id:
+            task = task_store.get_task(task_id)
+            if task:
+                task_suffix = f"  →  {task.title}"
+        items.append((key, f"{title}{task_suffix}"))
+
+    selected = await _run_arrow_picker(f"{__logo__} 选择会话", items)
+
+    if selected is None or selected == "__new__":
+        task_id = await _pick_task_tui(agent_loop.workspace)
+        short_id = uuid.uuid4().hex[:8]
+        new_key = f"cli:{short_id}"
+        session = sessions_mgr.get_or_create(new_key)
+        session.title = f"会话 {short_id}"
+        if task_id:
+            session.metadata["task_id"] = task_id
+        sessions_mgr.save(session)
+        return new_key
+
+    return selected
+
+
 async def _read_interactive_input_async(prompt: HTML | None = None) -> str:
     """Read user input using prompt_toolkit (handles paste, history, display).
 
@@ -925,7 +1040,7 @@ def gateway(
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    session_id: str | None = typer.Option(None, "--session", "-s", help="Session ID (omit to pick interactively)"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
@@ -979,7 +1094,7 @@ def agent(
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
     )
     restart_notice = consume_restart_notice_from_env()
-    if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):
+    if restart_notice and session_id and should_show_cli_restart_notice(restart_notice, session_id):
         _print_agent_response(
             format_restart_completed_message(restart_notice.started_at_raw),
             render_markdown=False,
@@ -1001,7 +1116,7 @@ def agent(
         async def run_once():
             renderer = StreamRenderer(render_markdown=markdown)
             response = await agent_loop.process_direct(
-                message, session_id,
+                message, session_id or "cli:direct",
                 on_progress=_cli_progress,
                 on_stream=renderer.on_delta,
                 on_stream_end=renderer.on_end,
@@ -1021,11 +1136,6 @@ def agent(
         from nanobot.bus.events import InboundMessage
         _init_prompt_session()
         console.print(f"{__logo__} Interactive mode [bold blue]({config.agents.defaults.model})[/bold blue] — type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit\n")
-
-        if ":" in session_id:
-            cli_channel, cli_chat_id = session_id.split(":", 1)
-        else:
-            cli_channel, cli_chat_id = "cli", session_id
 
         def _handle_signal(signum, frame):
             sig_name = signal.Signals(signum).name
@@ -1050,9 +1160,15 @@ def agent(
             turn_response: list[tuple[str, dict]] = []
             renderer: StreamRenderer | None = None
 
+            # Determine initial session: use explicit --session arg or show TUI picker
+            if session_id is not None:
+                _initial_key = session_id if ":" in session_id else f"cli:{session_id}"
+            else:
+                _initial_key = await _pick_session_tui(agent_loop)
+
             # Mutable current session key — updated by _session_switch signals.
             # Using a list so the closure in _consume_outbound can mutate it.
-            _current_session_key: list[str] = [f"{cli_channel}:{cli_chat_id}"]
+            _current_session_key: list[str] = [_initial_key]
 
             async def _consume_outbound():
                 while True:
@@ -1118,8 +1234,8 @@ def agent(
 
                         # Build dynamic prompt showing current session + task context
                         _cur_key = _current_session_key[0]
-                        _session_label = _cur_key.split(":", 1)[-1] if ":" in _cur_key else _cur_key
                         _session = agent_loop.sessions.get_or_create(_cur_key)
+                        _session_label = _session.title if _session.title else (_cur_key.split(":", 1)[-1] if ":" in _cur_key else _cur_key)
                         _task_id = _session.metadata.get("task_id")
                         _task_title: str | None = None
                         if _task_id:
@@ -1143,7 +1259,7 @@ def agent(
 
                         _cur_key = _current_session_key[0]
                         _cur_channel, _cur_chat_id = (
-                            _cur_key.split(":", 1) if ":" in _cur_key else (cli_channel, _cur_key)
+                            _cur_key.split(":", 1) if ":" in _cur_key else ("cli", _cur_key)
                         )
                         await bus.publish_inbound(InboundMessage(
                             channel=_cur_channel,

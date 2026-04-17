@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
@@ -24,6 +24,19 @@ class CommandContext:
     loop: Any = None
 
 
+@dataclass
+class CommandMetadata:
+    """Metadata describing a registered command for agent exposure."""
+
+    pattern: str
+    handler: Handler
+    description: str = ""
+    agent_accessible: bool = False
+    agent_description: str = ""
+    agent_parameters: dict[str, Any] = field(default_factory=dict)
+    confirmation_required: bool = False
+
+
 class CommandRouter:
     """Pure dict-based command dispatch.
 
@@ -40,22 +53,109 @@ class CommandRouter:
         self._exact: dict[str, Handler] = {}
         self._prefix: list[tuple[str, Handler]] = []
         self._interceptors: list[Handler] = []
+        self._meta: dict[str, CommandMetadata] = {}
 
-    def priority(self, cmd: str, handler: Handler) -> None:
+    def _register_meta(
+        self,
+        pattern: str,
+        handler: Handler,
+        *,
+        description: str = "",
+        agent_accessible: bool = False,
+        agent_description: str = "",
+        agent_parameters: dict[str, Any] | None = None,
+        confirmation_required: bool = False,
+    ) -> None:
+        self._meta[pattern] = CommandMetadata(
+            pattern=pattern,
+            handler=handler,
+            description=description,
+            agent_accessible=agent_accessible,
+            agent_description=agent_description,
+            agent_parameters=agent_parameters or {},
+            confirmation_required=confirmation_required,
+        )
+
+    def priority(
+        self,
+        cmd: str,
+        handler: Handler,
+        *,
+        description: str = "",
+        agent_accessible: bool = False,
+        agent_description: str = "",
+        agent_parameters: dict[str, Any] | None = None,
+        confirmation_required: bool = False,
+    ) -> None:
         self._priority[cmd] = handler
+        self._register_meta(
+            cmd,
+            handler,
+            description=description,
+            agent_accessible=agent_accessible,
+            agent_description=agent_description,
+            agent_parameters=agent_parameters,
+            confirmation_required=confirmation_required,
+        )
 
-    def exact(self, cmd: str, handler: Handler) -> None:
+    def exact(
+        self,
+        cmd: str,
+        handler: Handler,
+        *,
+        description: str = "",
+        agent_accessible: bool = False,
+        agent_description: str = "",
+        agent_parameters: dict[str, Any] | None = None,
+        confirmation_required: bool = False,
+    ) -> None:
         self._exact[cmd] = handler
+        self._register_meta(
+            cmd,
+            handler,
+            description=description,
+            agent_accessible=agent_accessible,
+            agent_description=agent_description,
+            agent_parameters=agent_parameters,
+            confirmation_required=confirmation_required,
+        )
 
-    def prefix(self, pfx: str, handler: Handler) -> None:
+    def prefix(
+        self,
+        pfx: str,
+        handler: Handler,
+        *,
+        description: str = "",
+        agent_accessible: bool = False,
+        agent_description: str = "",
+        agent_parameters: dict[str, Any] | None = None,
+        confirmation_required: bool = False,
+    ) -> None:
         self._prefix.append((pfx, handler))
         self._prefix.sort(key=lambda p: len(p[0]), reverse=True)
+        self._register_meta(
+            pfx,
+            handler,
+            description=description,
+            agent_accessible=agent_accessible,
+            agent_description=agent_description,
+            agent_parameters=agent_parameters,
+            confirmation_required=confirmation_required,
+        )
 
     def intercept(self, handler: Handler) -> None:
         self._interceptors.append(handler)
 
     def is_priority(self, text: str) -> bool:
         return text.strip().lower() in self._priority
+
+    def get_agent_accessible_commands(self) -> list[CommandMetadata]:
+        """Return all commands marked as agent_accessible."""
+        return [m for m in self._meta.values() if m.agent_accessible]
+
+    def get_command_metadata(self, pattern: str) -> CommandMetadata | None:
+        """Return metadata for a specific command pattern."""
+        return self._meta.get(pattern)
 
     async def dispatch_priority(self, ctx: CommandContext) -> OutboundMessage | None:
         """Dispatch a priority command. Called from run() without the lock."""

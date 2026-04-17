@@ -13,11 +13,42 @@ from nanobot.config.paths import get_legacy_sessions_dir
 from nanobot.utils.helpers import ensure_dir, find_legal_message_start, safe_filename
 
 
+def _auto_title(key: str) -> str:
+    """Generate a default title from a session key."""
+    if ":" not in key:
+        return key
+    channel, suffix = key.split(":", 1)
+    if channel == "cli":
+        return "Direct" if suffix == "direct" else suffix.replace("-", " ").replace("_", " ").title()
+    if channel == "feishu":
+        if suffix.startswith("ou_"):
+            return f"飞书 {suffix[3:11]}"
+        if suffix.startswith("oc_"):
+            return f"飞书群组 {suffix[3:11]}"
+        return f"飞书 {suffix}"
+    if channel == "telegram":
+        return f"Telegram {suffix}"
+    if channel == "slack":
+        return f"Slack {suffix}"
+    if channel == "discord":
+        return f"Discord {suffix}"
+    if channel == "unified":
+        return "Unified"
+    if channel == "cron":
+        return f"Cron {suffix}"
+    if channel == "api":
+        return f"API {suffix}" if suffix != "default" else "API"
+    if channel == "sdk":
+        return "SDK"
+    return suffix
+
+
 @dataclass
 class Session:
     """A conversation session."""
 
-    key: str  # channel:chat_id
+    key: str  # channel:chat_id, immutable, auto-generated
+    title: str = ""  # user-editable display name
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
@@ -131,7 +162,7 @@ class SessionManager:
 
         session = self._load(key)
         if session is None:
-            session = Session(key=key)
+            session = Session(key=key, title=_auto_title(key))
 
         self._cache[key] = session
         return session
@@ -154,6 +185,7 @@ class SessionManager:
         try:
             messages = []
             metadata = {}
+            title = ""
             created_at = None
             updated_at = None
             last_consolidated = 0
@@ -168,6 +200,7 @@ class SessionManager:
 
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
+                        title = data.get("title", "") or _auto_title(key)
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
                         updated_at = datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else None
                         last_consolidated = data.get("last_consolidated", 0)
@@ -176,6 +209,7 @@ class SessionManager:
 
             return Session(
                 key=key,
+                title=title,
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 updated_at=updated_at or datetime.now(),
@@ -194,6 +228,7 @@ class SessionManager:
             metadata_line = {
                 "_type": "metadata",
                 "key": session.key,
+                "title": session.title,
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
@@ -205,6 +240,15 @@ class SessionManager:
 
         self._cache[session.key] = session
 
+    def delete(self, key: str) -> bool:
+        """Delete a session from disk and cache. Returns True if deleted."""
+        path = self._get_session_path(key)
+        deleted = path.exists()
+        if deleted:
+            path.unlink()
+        self._cache.pop(key, None)
+        return deleted
+
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
@@ -214,13 +258,12 @@ class SessionManager:
         List all sessions.
 
         Returns:
-            List of session info dicts.
+            List of session info dicts with keys: key, title, created_at, updated_at, path.
         """
         sessions = []
 
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
-                # Read just the metadata line
                 with open(path, encoding="utf-8") as f:
                     first_line = f.readline().strip()
                     if first_line:
@@ -229,6 +272,7 @@ class SessionManager:
                             key = data.get("key") or path.stem.replace("_", ":", 1)
                             sessions.append({
                                 "key": key,
+                                "title": data.get("title", "") or _auto_title(key),
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 "path": str(path)

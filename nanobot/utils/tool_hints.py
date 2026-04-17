@@ -35,7 +35,9 @@ def format_tool_hints(tool_calls: list) -> str:
     formatted = []
     for tc in tool_calls:
         fmt = _TOOL_FORMATS.get(tc.name)
-        if fmt:
+        if tc.name == "run_command":
+            formatted.append(_fmt_run_command(tc))
+        elif fmt:
             formatted.append(_fmt_known(tc, fmt))
         elif tc.name.startswith("mcp_"):
             formatted.append(_fmt_mcp(tc))
@@ -107,6 +109,19 @@ def _abbreviate_command(cmd: str, max_len: int = 80) -> str:
     return abbreviated[:max_len - 1] + "\u2026"
 
 
+def _fmt_run_command(tc) -> str:
+    """Format run_command with both command and args visible."""
+    args = _get_args(tc)
+    command = args.get("command", "")
+    args_val = args.get("args", "")
+    if not isinstance(command, str):
+        command = ""
+    if not isinstance(args_val, str):
+        args_val = ""
+    display = f"{command} {args_val}".strip() if args_val else command
+    return f'run_command("{display}")'
+
+
 def _fmt_mcp(tc) -> str:
     """Format MCP tool as server::tool."""
     name = tc.name
@@ -156,6 +171,15 @@ def format_tool_result(tool_name: str, result: object) -> str:
             base = f"{mark} exit {code}"
             return base + (f": {detail}" if detail else "")
         return ""
+
+    if tool_name == "run_command":
+        lines = [l.strip() for l in result_str.splitlines() if l.strip()]
+        detail = lines[0][:80] if lines else ""
+        if result_str.startswith("Error:") or result_str.startswith("[Destructive"):
+            mark = "\u2717"
+        else:
+            mark = "\u2713"
+        return f"{mark} {detail}" if detail else mark
 
     # Generic tools: detect errors
     if result_str.startswith("Error:"):

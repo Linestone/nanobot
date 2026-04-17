@@ -29,6 +29,7 @@ class ChannelsConfig(Base):
     send_tool_hints: bool = True  # stream tool-call hints (e.g. read_file("…"))
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
     transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
+    send_session_label: bool = True  # Prepend [session] / task context header before IM channel responses
 
 
 class DreamConfig(Base):

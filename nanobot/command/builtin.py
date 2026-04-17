@@ -866,6 +866,29 @@ def build_help_text() -> str:
     return "\n".join(lines)
 
 
+def _resolve_session(ctx: CommandContext, target: str) -> str | None:
+    """Resolve target (title, key suffix, or full key) to a session key. Returns None if not found."""
+    mgr = ctx.loop.sessions
+    # Full key match
+    if mgr._get_session_path(target).exists():
+        return target
+    # channel:target key match
+    candidate = f"{ctx.msg.channel}:{target}"
+    if mgr._get_session_path(candidate).exists():
+        return candidate
+    # Title match (case-insensitive, first match wins)
+    lower = target.lower()
+    for info in mgr.list_sessions():
+        if info.get("title", "").lower() == lower:
+            return info["key"]
+    return None
+
+
+def _session_label(key: str, title: str) -> str:
+    """Return the display label for a session: title if set, else key suffix."""
+    return title if title else (key.split(":", 1)[-1] if ":" in key else key)
+
+
 async def cmd_session_list(ctx: CommandContext) -> OutboundMessage:
     """List all sessions with their attached task (if any)."""
     loop = ctx.loop
@@ -878,8 +901,8 @@ async def cmd_session_list(ctx: CommandContext) -> OutboundMessage:
         current_key = ctx.msg.metadata.get("_current_session_key", ctx.key) if ctx.msg.metadata else ctx.key
         for info in session_infos:
             s_key = info["key"]
+            s_title = info.get("title", "")
             is_current = s_key == current_key
-            # Load session to read metadata
             s = loop.sessions.get_or_create(s_key)
             task_id = s.metadata.get("task_id")
             if task_id:
@@ -887,9 +910,12 @@ async def cmd_session_list(ctx: CommandContext) -> OutboundMessage:
                 task_label = f" → {task.title} ({task_id})" if task else f" → task:{task_id}"
             else:
                 task_label = ""
-            current_marker = " (current)" if is_current else ""
-            label = s_key.split(":", 1)[-1] if ":" in s_key else s_key
-            lines.append(f"- `{label}`{task_label}{current_marker}")
+            current_marker = " <当前会话>" if is_current else ""
+            key_suffix = s_key.split(":", 1)[-1] if ":" in s_key else s_key
+            if s_title:
+                lines.append(f"- {s_title} ({key_suffix}){task_label}{current_marker}")
+            else:
+                lines.append(f"- {key_suffix}{task_label}{current_marker}")
         content = "\n".join(lines)
     return OutboundMessage(
         channel=ctx.msg.channel,
@@ -900,37 +926,29 @@ async def cmd_session_list(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_session_switch(ctx: CommandContext) -> OutboundMessage:
-    """Switch to another session by name."""
+    """Switch to an existing session by title or key."""
     target = ctx.args.strip()
     if not target:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content="Usage: /session switch <session_name>",
+            content="Usage: /session switch <title_or_key>",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
-    # Normalize: if it already has a channel prefix use as-is, otherwise prepend channel
-    if ":" in target:
-        new_key = target
-    else:
-        new_key = f"{ctx.msg.channel}:{target}"
-    label = new_key.split(":", 1)[-1]
-
-    session_exists = ctx.loop.sessions._get_session_path(new_key).exists()
-    if not session_exists:
+    new_key = _resolve_session(ctx, target)
+    if not new_key:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content=(
-                f"Session `{label}` does not exist. "
-                f"Use `/session new {label}` to create it, or `/session list` to see existing sessions."
-            ),
+            content=f"Session `{target}` not found. Use `/session list` to see existing sessions.",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
+    session = ctx.loop.sessions.get_or_create(new_key)
+    label = _session_label(new_key, session.title)
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content=f"Switched to session `{label}`.",
+        content=f"Switched to session **{label}**.",
         metadata={
             **dict(ctx.msg.metadata or {}),
             "render_as": "text",
@@ -940,16 +958,19 @@ async def cmd_session_switch(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_session_new(ctx: CommandContext) -> OutboundMessage:
-    """Create and switch to a new named session (or a generated one)."""
+    """Create a new session with an auto-generated key; optional title argument."""
     import uuid
-    name = ctx.args.strip() or uuid.uuid4().hex[:8]
-    new_key = f"{ctx.msg.channel}:{name}"
-    # Eagerly create so it shows up in /session list
-    ctx.loop.sessions.get_or_create(new_key)
+    title = ctx.args.strip()
+    new_key = f"{ctx.msg.channel}:{uuid.uuid4().hex[:8]}"
+    session = ctx.loop.sessions.get_or_create(new_key)
+    if title:
+        session.title = title
+    ctx.loop.sessions.save(session)
+    label = _session_label(new_key, session.title)
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content=f"Created and switched to session `{name}`.",
+        content=f"Created and switched to session **{label}**.",
         metadata={
             **dict(ctx.msg.metadata or {}),
             "render_as": "text",
@@ -958,13 +979,125 @@ async def cmd_session_new(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_session_rename(ctx: CommandContext) -> OutboundMessage:
+    """Rename (set title of) the current session."""
+    new_title = ctx.args.strip()
+    if not new_title:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /session rename <new_title>",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    current_key = ctx.msg.metadata.get("_current_session_key", ctx.key) if ctx.msg.metadata else ctx.key
+    session = ctx.loop.sessions.get_or_create(current_key)
+    session.title = new_title
+    ctx.loop.sessions.save(session)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Session renamed to **{new_title}**.",
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_session_delete(ctx: CommandContext) -> OutboundMessage:
+    """Delete a session by title or key. Cannot delete the current session."""
+    target = ctx.args.strip()
+    if not target:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /session delete <title_or_key>",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    del_key = _resolve_session(ctx, target)
+    if not del_key:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Session `{target}` not found.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    current_key = ctx.msg.metadata.get("_current_session_key", ctx.key) if ctx.msg.metadata else ctx.key
+    if del_key == current_key:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Cannot delete the current session. Switch to another session first.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    session = ctx.loop.sessions.get_or_create(del_key)
+    label = _session_label(del_key, session.title)
+    ctx.loop.sessions.delete(del_key)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Session **{label}** deleted.",
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_session_show(ctx: CommandContext) -> OutboundMessage:
+    """Show details of the current or specified session."""
+    target = ctx.args.strip()
+    current_key = ctx.msg.metadata.get("_current_session_key", ctx.key) if ctx.msg.metadata else ctx.key
+
+    if target:
+        show_key = _resolve_session(ctx, target)
+        if not show_key:
+            return OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=f"Session `{target}` not found.",
+                metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+            )
+    else:
+        show_key = current_key
+
+    session = ctx.loop.sessions.get_or_create(show_key)
+    key_suffix = show_key.split(":", 1)[-1] if ":" in show_key else show_key
+    is_current = show_key == current_key
+
+    store = TaskTreeStore(ctx.loop.workspace)
+    task_id = session.metadata.get("task_id")
+    task_line = ""
+    if task_id:
+        task = store.get_task(task_id)
+        task_line = f"\n**Task:** {task.title} ({task_id})" if task else f"\n**Task:** {task_id}"
+
+    lines = [f"## Session: {_session_label(show_key, session.title)}"]
+    if is_current:
+        lines[0] += " (current)"
+    title_display = session.title if session.title else "(未设置)"
+    lines += [
+        "",
+        f"**Key:** `{show_key}`",
+        f"**Title:** {title_display}",
+        f"**Messages:** {len(session.messages)}",
+        f"**Created:** {session.created_at.strftime('%Y-%m-%d %H:%M')}",
+        f"**Updated:** {session.updated_at.strftime('%Y-%m-%d %H:%M')}",
+    ]
+    if task_line:
+        lines.append(task_line.strip())
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content="\n".join(lines),
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
 async def cmd_session_help(ctx: CommandContext) -> OutboundMessage:
     content = "\n".join([
         "## Session Commands",
         "",
         "/session list — List all sessions",
-        "/session switch <name> — Switch to an existing session",
-        "/session new [name] — Create and switch to a new session",
+        "/session new [title] — Create a new session (auto-generated key, optional title)",
+        "/session switch <title_or_key> — Switch to an existing session",
+        "/session rename <new_title> — Rename the current session",
+        "/session show [title_or_key] — Show session details",
+        "/session delete <title_or_key> — Delete a session",
     ])
     return OutboundMessage(
         channel=ctx.msg.channel,
@@ -1104,31 +1237,108 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
-    router.exact("/dream", cmd_dream)
-    router.exact("/dream-log", cmd_dream_log)
-    router.prefix("/dream-log ", cmd_dream_log)
-    router.exact("/dream-restore", cmd_dream_restore)
-    router.prefix("/dream-restore ", cmd_dream_restore)
+    router.exact("/dream", cmd_dream,
+                 agent_accessible=True,
+                 agent_description="Manually trigger Dream memory consolidation for the current session.")
+    router.exact("/dream-log", cmd_dream_log,
+                 agent_accessible=True,
+                 agent_description="Show what the last Dream consolidation changed.")
+    router.prefix("/dream-log ", cmd_dream_log,
+                  agent_accessible=True,
+                  agent_description="Show Dream log for a specific number of entries.",
+                  agent_parameters={"n": {"type": "integer", "description": "Number of entries to show"}})
+    router.exact("/dream-restore", cmd_dream_restore,
+                 agent_accessible=True,
+                 confirmation_required=True,
+                 agent_description="Revert memory to a previous Dream checkpoint.")
+    router.prefix("/dream-restore ", cmd_dream_restore,
+                  agent_accessible=True,
+                  confirmation_required=True,
+                  agent_description="Revert memory to a specific checkpoint ID.",
+                  agent_parameters={"checkpoint_id": {"type": "string", "description": "Checkpoint ID to restore"}})
     router.exact("/task", cmd_task_help)
     router.exact("/task help", cmd_task_help)
-    router.prefix("/task create ", cmd_task_create)
-    router.exact("/task list", cmd_task_list)
-    router.prefix("/task list ", cmd_task_list)
-    router.prefix("/task show ", cmd_task_show)
-    router.prefix("/task memory add ", cmd_task_memory_add)
-    router.prefix("/task memory view ", cmd_task_memory_view)
-    router.prefix("/task children ", cmd_task_children)
-    router.prefix("/task tree", cmd_task_tree)
-    router.prefix("/task move ", cmd_task_move)
-    router.prefix("/task delete ", cmd_task_delete)
-    router.prefix("/task attach ", cmd_task_attach)
-    router.exact("/task detach", cmd_task_detach)
-    router.prefix("/task status ", cmd_task_status)
-    router.prefix("/task update ", cmd_task_update)
+    router.prefix("/task create ", cmd_task_create,
+                  agent_accessible=True,
+                  agent_description="Create a new task. Optional parent task, title, and description (separated by '|').",
+                  agent_parameters={
+                      "args": {"type": "string", "description": "e.g. '--parent <id> Title | Description'", "required": True}
+                  })
+    router.exact("/task list", cmd_task_list,
+                 agent_accessible=True,
+                 agent_description="List all tasks, optionally filtered by status.")
+    router.prefix("/task list ", cmd_task_list,
+                  agent_accessible=True,
+                  agent_description="List tasks filtered by a specific status.",
+                  agent_parameters={"status": {"type": "string", "description": "Filter by status: todo, doing, done, blocked"}})
+    router.prefix("/task show ", cmd_task_show,
+                  agent_accessible=True,
+                  agent_description="Show detailed information about a task.",
+                  agent_parameters={"task_id": {"type": "string", "description": "Task ID to show", "required": True}})
+    router.prefix("/task memory add ", cmd_task_memory_add,
+                  agent_accessible=True,
+                  agent_description="Add a memory entry to a task. Format: <task_id> | <content>",
+                  agent_parameters={
+                      "args": {"type": "string", "description": "e.g. 'task_abc123 | Fixed the auth bug'", "required": True}
+                  })
+    router.prefix("/task memory view ", cmd_task_memory_view,
+                  agent_accessible=True,
+                  agent_description="View memory entries for a task.",
+                  agent_parameters={"task_id": {"type": "string", "description": "Task ID", "required": True}})
+    router.prefix("/task children ", cmd_task_children,
+                  agent_accessible=True,
+                  agent_description="List direct children of a task.",
+                  agent_parameters={"task_id": {"type": "string", "description": "Task ID", "required": True}})
+    router.prefix("/task tree", cmd_task_tree,
+                  agent_accessible=True,
+                  agent_description="Show the task hierarchy tree. Optionally pass a root task ID.")
+    router.prefix("/task move ", cmd_task_move,
+                  agent_accessible=True,
+                  agent_description="Move a task under a different parent.",
+                  agent_parameters={
+                      "task_id": {"type": "string", "description": "Task to move", "required": True},
+                      "parent_id": {"type": "string", "description": "New parent task ID", "required": True},
+                  })
+    router.prefix("/task delete ", cmd_task_delete,
+                  agent_accessible=True,
+                  confirmation_required=True,
+                  agent_description="Delete a task. Its direct children become orphaned.",
+                  agent_parameters={"task_id": {"type": "string", "description": "Task ID to delete", "required": True}})
+    router.prefix("/task attach ", cmd_task_attach,
+                  agent_accessible=True,
+                  agent_description="Attach the current session to a task. All subsequent task memory operations bind to this task.",
+                  agent_parameters={"task_id": {"type": "string", "description": "Task ID to attach", "required": True}})
+    router.exact("/task detach", cmd_task_detach,
+                 agent_accessible=True,
+                 agent_description="Detach the current session from its bound task.")
+    router.prefix("/task status ", cmd_task_status,
+                  agent_accessible=True,
+                  agent_description="Update the status of a task.",
+                  agent_parameters={
+                      "task_id": {"type": "string", "description": "Task ID", "required": True},
+                      "status": {"type": "string", "description": "New status: todo, doing, done, blocked", "required": True},
+                  })
+    router.prefix("/task update ", cmd_task_update,
+                  agent_accessible=True,
+                  agent_description="Update task fields: --title, --description, --status, --parent.",
+                  agent_parameters={
+                      "task_id": {"type": "string", "description": "Task ID", "required": True},
+                      "args": {"type": "string", "description": "e.g. '--title New Title --status done'", "required": True},
+                  })
     router.exact("/session", cmd_session_help)
-    router.exact("/session list", cmd_session_list)
-    router.prefix("/session switch ", cmd_session_switch)
+    router.exact("/session list", cmd_session_list,
+                 agent_accessible=True,
+                 agent_description="List all sessions.")
+    router.prefix("/session switch ", cmd_session_switch,
+                  agent_accessible=True,
+                  agent_description="Switch to a different session by key.",
+                  agent_parameters={"session_key": {"type": "string", "description": "Session key to switch to", "required": True}})
     router.prefix("/session new", cmd_session_new)
+    router.prefix("/session rename", cmd_session_rename)
+    router.prefix("/session delete ", cmd_session_delete)
+    router.prefix("/session show", cmd_session_show,
+                  agent_accessible=True,
+                  agent_description="Show details of the current session.")
     router.exact("/export-context", cmd_export_context)
     router.prefix("/export-context ", cmd_export_context)
     router.exact("/help", cmd_help)

@@ -196,8 +196,46 @@ class ChannelManager:
                 break
 
     @staticmethod
-    async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
+    def _build_display_prompt_prefix(msg: OutboundMessage) -> str | None:
+        if not msg.metadata.get("_display_prompt"):
+            return None
+        if msg.metadata.get("_progress") or msg.metadata.get("_tool_hint"):
+            return None
+        if msg.metadata.get("_stream_end"):
+            return None
+        if msg.metadata.get("_stream_delta") and msg.metadata.get("_display_prompt_sent"):
+            return None
+
+        session_label = msg.metadata.get("_session_label")
+        task_title = msg.metadata.get("_task_title")
+        parts: list[str] = []
+        if task_title:
+            parts.append(f"({task_title})")
+        if session_label:
+            parts.append(f"[{session_label}]")
+        parts.append("\n")
+        return "".join(parts)
+
+    @classmethod
+    def _decorate_outbound_message(
+        cls, msg: OutboundMessage, *, show_session_label: bool = True
+    ) -> OutboundMessage:
+        if not show_session_label:
+            return msg
+        prefix = cls._build_display_prompt_prefix(msg)
+        if not prefix:
+            return msg
+        msg.content = f"{prefix}{msg.content or ''}"
+        if msg.metadata.get("_stream_delta"):
+            msg.metadata["_display_prompt_sent"] = True
+        return msg
+
+    @staticmethod
+    async def _send_once(
+        channel: BaseChannel, msg: OutboundMessage, *, show_session_label: bool = True
+    ) -> None:
         """Send one outbound message without retry policy."""
+        msg = ChannelManager._decorate_outbound_message(msg, show_session_label=show_session_label)
         if msg.metadata.get("_stream_delta") or msg.metadata.get("_stream_end"):
             await channel.send_delta(msg.chat_id, msg.content, msg.metadata)
         elif not msg.metadata.get("_streamed"):
@@ -260,9 +298,10 @@ class ChannelManager:
         """
         max_attempts = max(self.config.channels.send_max_retries, 1)
 
+        show_label = self.config.channels.send_session_label
         for attempt in range(max_attempts):
             try:
-                await self._send_once(channel, msg)
+                await self._send_once(channel, msg, show_session_label=show_label)
                 return  # Send succeeded
             except asyncio.CancelledError:
                 raise  # Propagate cancellation for graceful shutdown

@@ -25,6 +25,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.run_command import RunCommandTool
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
@@ -256,9 +257,9 @@ class AgentLoop:
             model=self.model,
             task_store=self.context.task_store,
         )
-        self._register_default_tools()
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
+        self._register_default_tools()
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -298,6 +299,7 @@ class AgentLoop:
         self.tools.register(TaskMemoryUpdateTool(self.workspace))
         self.tools.register(TaskMemoryDeleteTool(self.workspace))
         self.tools.register(TaskMemoryListTool(self.workspace))
+        self.tools.register(RunCommandTool(router=self.commands, loop=self))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -344,6 +346,14 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(task_id)
+        if tool := self.tools.get("run_command"):
+            if hasattr(tool, "set_context"):
+                tool.set_context(
+                    session_key=f"{channel}:{chat_id}",
+                    channel=channel,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -542,6 +552,12 @@ class AgentLoop:
         pending = asyncio.Queue(maxsize=20)
         self._pending_queues[session_key] = pending
 
+        session = self.sessions.get_or_create(session_key)
+        task_id = session.metadata.get("task_id")
+        display_meta = self._attach_display_prompt_metadata(
+            dict(msg.metadata or {}), session_key, task_id
+        )
+
         try:
             async with lock, gate:
                 try:
@@ -555,7 +571,7 @@ class AgentLoop:
                             return f"{stream_base_id}:{stream_segment}"
 
                         async def on_stream(delta: str) -> None:
-                            meta = dict(msg.metadata or {})
+                            meta = dict(display_meta)
                             meta["_stream_delta"] = True
                             meta["_stream_id"] = _current_stream_id()
                             await self.bus.publish_outbound(OutboundMessage(
@@ -563,10 +579,11 @@ class AgentLoop:
                                 content=delta,
                                 metadata=meta,
                             ))
+                            display_meta["_display_prompt_sent"] = True
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
                             nonlocal stream_segment
-                            meta = dict(msg.metadata or {})
+                            meta = dict(display_meta)
                             meta["_stream_end"] = True
                             meta["_resuming"] = resuming
                             meta["_stream_id"] = _current_stream_id()
@@ -690,6 +707,11 @@ class AgentLoop:
                 channel=channel,
                 chat_id=chat_id,
                 content=final_content or "Background task completed.",
+                metadata=self._attach_display_prompt_metadata(
+                    {},
+                    f"{channel}:{chat_id}",
+                    task_id,
+                ),
             )
 
         # Extract document text from media at the processing boundary so all
@@ -719,6 +741,12 @@ class AgentLoop:
             # Re-read task_id: a slash command (e.g. /task attach) may have
             # mutated session metadata between the read above and here.
             task_id = session.metadata.get("task_id")
+            if isinstance(result, OutboundMessage):
+                result.metadata = self._attach_display_prompt_metadata(
+                    result.metadata,
+                    key,
+                    task_id,
+                )
             return result
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
@@ -803,7 +831,7 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        meta = dict(msg.metadata or {})
+        meta = self._attach_display_prompt_metadata(dict(msg.metadata or {}), key, task_id)
         if on_stream is not None and stop_reason != "error":
             meta["_streamed"] = True
         return OutboundMessage(
@@ -812,6 +840,27 @@ class AgentLoop:
             content=final_content,
             metadata=meta,
         )
+
+    def _format_session_label(self, session_key: str) -> str:
+        session = self.sessions.get_or_create(session_key)
+        if session.title:
+            return session.title
+        return session_key.split(":", 1)[-1] if ":" in session_key else session_key
+
+    def _attach_display_prompt_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+        session_key: str,
+        task_id: str | None,
+    ) -> dict[str, Any]:
+        meta = dict(metadata or {})
+        meta["_display_prompt"] = True
+        meta["_session_label"] = self._format_session_label(session_key)
+        if task_id:
+            task = self.context.task_store.get_task(task_id)
+            if task:
+                meta["_task_title"] = task.title
+        return meta
 
     def _sanitize_persisted_blocks(
         self,

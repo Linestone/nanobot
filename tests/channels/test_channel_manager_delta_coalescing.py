@@ -1,6 +1,6 @@
 """Tests for ChannelManager delta coalescing to reduce streaming latency."""
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, ANY
 
 import pytest
 
@@ -244,6 +244,7 @@ class TestDeltaCoalescing:
 
         assert merged.content == "Only message"
         assert len(pending) == 0
+
 
 
 class TestDispatchOutboundWithCoalescing:
