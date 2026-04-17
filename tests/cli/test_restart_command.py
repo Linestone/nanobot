@@ -127,7 +127,8 @@ class TestRestartCommand:
         assert response is not None
         assert "/restart" in response.content
         assert "/status" in response.content
-        assert response.metadata == {"render_as": "text"}
+        assert response.metadata.get("render_as") == "text"
+        assert response.metadata.get("_display_prompt") is True
 
     @pytest.mark.asyncio
     async def test_status_reports_runtime_info(self):
@@ -153,7 +154,8 @@ class TestRestartCommand:
         assert "Session: 3 messages" in response.content
         assert "Uptime: 2m 5s" in response.content
         assert "Tasks: 0 active" in response.content
-        assert response.metadata == {"render_as": "text"}
+        assert response.metadata.get("render_as") == "text"
+        assert response.metadata.get("_display_prompt") is True
 
     @pytest.mark.asyncio
     async def test_status_counts_running_dispatch_and_subagent_tasks(self):
@@ -228,4 +230,5 @@ class TestRestartCommand:
         response = await loop.process_direct("/status", session_key="cli:test")
 
         assert response is not None
-        assert response.metadata == {"render_as": "text"}
+        assert response.metadata.get("render_as") == "text"
+        assert response.metadata.get("_display_prompt") is True
