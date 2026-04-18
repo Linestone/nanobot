@@ -73,17 +73,23 @@ class RunCommandTool(Tool):
     def _resolve_pattern(self, command: str) -> str | None:
         """Map a user-supplied command to the internal router pattern.
 
-        Handles the common case where prefix commands are registered with a
-        trailing space (e.g. '/task create ') but the LLM passes '/task create'.
+        Handles two common LLM mistakes:
+        1. Prefix commands registered with trailing space but LLM omits it.
+        2. LLM includes args in the command field (e.g. '/task delete abc123').
         """
         accessible = self._router.get_agent_accessible_commands()
         allowed_patterns = {m.pattern for m in accessible}
         if command in allowed_patterns:
             return command
-        # Prefix patterns often end with a space — try appending one.
+        # Try appending a space (prefix patterns end with a space).
         spaced = command + " "
         if spaced in allowed_patterns:
             return spaced
+        # LLM may have bundled args into the command field — find the longest prefix match.
+        for pattern in sorted(allowed_patterns, key=len, reverse=True):
+            stripped = pattern.rstrip()
+            if command == stripped or command.startswith(stripped + " "):
+                return pattern
         return None
 
     @property
@@ -127,7 +133,12 @@ class RunCommandTool(Tool):
         if meta is None:
             return f"Error: no metadata found for '{command}'."
 
-        full_raw = f"{resolved}{args}".strip() if args else resolved
+        # If the LLM bundled args into the command field, extract them.
+        resolved_base = resolved.rstrip()
+        inline_args = command[len(resolved_base):].strip() if len(command) > len(resolved_base) else ""
+        merged_args = " ".join(filter(None, [inline_args, args])) or None
+
+        full_raw = f"{resolved}{merged_args}".strip() if merged_args else resolved
 
         msg = InboundMessage(
             channel=self._channel,

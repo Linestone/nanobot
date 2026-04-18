@@ -363,7 +363,6 @@ def _task_parse_update_args(raw: str) -> tuple[str, dict[str, str | None]]:
         "title": None,
         "description": None,
         "status": None,
-        "parent_id": None,
     }
     i = 1
     while i < len(tokens):
@@ -380,10 +379,6 @@ def _task_parse_update_args(raw: str) -> tuple[str, dict[str, str | None]]:
             updates["status"] = tokens[i + 1].lower()
             i += 2
             continue
-        if token == "--parent" and i + 1 < len(tokens):
-            updates["parent_id"] = tokens[i + 1]
-            i += 2
-            continue
         i += 1
     return task_id, updates
 
@@ -391,21 +386,23 @@ def _task_parse_update_args(raw: str) -> tuple[str, dict[str, str | None]]:
 def _task_help_text() -> str:
     lines = [
         "🐈 nanobot task commands:",
-        "/task create [--parent <parent_id>] <title> | <description> — Create a new task",
-        "/task update <task_id> [--title <title>] [--description <desc>] [--status <status>] [--parent <parent_id>] — Update a task",
-        "/task status <task_id> <status> — Update task status (todo, doing, done, blocked)",
-        "/task list [status] — List tasks, optionally filtered by status",
-        "/task show <task_id> — Show a task's details",
-        "/task tree [<task_id>] — Show the task tree or subtree",
-        "/task children <task_id> — Show direct children of a task",
-        "/task move <task_id> <parent_id> — Move a task under a new parent",
-        "/task delete <task_id> — Delete a task and orphan its children",
-        "/task memory add <task_id> | <content> — Add a task-specific memory entry",
-        "/task memory view <task_id> — View task-specific memory entries",
-        "/task memory update <task_id> <entry_id> | <new_content> — Update a memory entry",
-        "/task memory delete <task_id> <entry_id> — Delete a memory entry",
-        "/task attach <task_id> — Attach this session to a task",
-        "/task detach — Detach the current task from this session",
+        "/task                              — Show current bound task (or this help)",
+        "/task create [--parent <id>] <title> | <desc> — Create a new task",
+        "/task update <id> [--title <t>] [--description <d>] [--status <s>] — Update fields",
+        "/task mark <id> <status>           — Set task status (todo, doing, done, blocked)",
+        "/task status <id>                  — Query task status",
+        "/task list [status]                — List tasks, optionally filtered by status",
+        "/task show <id>                    — Show a task's details",
+        "/task tree [<id>] [--depth <n>]    — Show task tree (--depth 1 = direct children only)",
+        "/task move <id> <parent_id>        — Move a task under a new parent",
+        "/task delete <id> [--cascade|--orphan] — Delete (default: refuse if has children)",
+        "/task memory add <id> | <content>  — Add a task memory entry",
+        "/task memory list <id>             — List task memory entries",
+        "/task memory update <id> <entry_id> | <new_content> — Update a memory entry",
+        "/task memory delete <id> <entry_id> — Delete a memory entry",
+        "",
+        "To bind/unbind this session to a task, use:",
+        "  /session bind <task_id>  |  /session unbind",
     ]
     return "\n".join(lines)
 
@@ -417,6 +414,22 @@ async def cmd_task_help(ctx: CommandContext) -> OutboundMessage:
         content=_task_help_text(),
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
+
+
+async def cmd_task_current(ctx: CommandContext) -> OutboundMessage:
+    """Show the currently bound task, or help if none is bound."""
+    task_id = ctx.session.metadata.get("task_id") if ctx.session else None
+    if task_id:
+        store = TaskTreeStore(ctx.loop.workspace)
+        content = store.build_task_summary(task_id)
+        if content:
+            return OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=content,
+                metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+            )
+    return await cmd_task_help(ctx)
 
 
 async def cmd_task_create(ctx: CommandContext) -> OutboundMessage:
@@ -538,15 +551,15 @@ async def cmd_task_memory_add(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_task_memory_view(ctx: CommandContext) -> OutboundMessage:
+async def cmd_task_memory_list(ctx: CommandContext) -> OutboundMessage:
     task_id = ctx.args.strip()
-    if task_id.startswith("view "):
-        task_id = task_id[len("view "):].strip()
+    if task_id.startswith("list "):
+        task_id = task_id[len("list "):].strip()
     if not task_id:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content="Usage: /task memory view <task_id>",
+            content="Usage: /task memory list <task_id>",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
     store = TaskTreeStore(ctx.loop.workspace)
@@ -631,70 +644,16 @@ async def cmd_task_memory_delete(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_task_attach(ctx: CommandContext) -> OutboundMessage:
-    task_id = ctx.args.strip()
-    if not task_id:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Please provide a task ID to attach this session to. Usage: /task attach <task_id>",
-            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-        )
-    store = TaskTreeStore(ctx.loop.workspace)
-    task = store.get_task(task_id)
-    if not task:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=f"Task `{task_id}` not found.",
-            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-        )
-    if not ctx.session:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Unable to attach task because this command requires an active session.",
-            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-        )
-    ctx.session.metadata["task_id"] = task.id
-    ctx.loop.sessions.save(ctx.session)
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=f"Attached current session to task `{task.title}` (`{task.id}`).",
-        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-    )
 
 
-async def cmd_task_detach(ctx: CommandContext) -> OutboundMessage:
-    if not ctx.session:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Unable to detach task because this command requires an active session.",
-            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-        )
-    if "task_id" not in ctx.session.metadata:
-        content = "No task is currently attached to this session."
-    else:
-        ctx.session.metadata.pop("task_id", None)
-        ctx.loop.sessions.save(ctx.session)
-        content = "Detached the current task from this session."
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=content,
-        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-    )
-
-
-async def cmd_task_status(ctx: CommandContext) -> OutboundMessage:
+async def cmd_task_mark(ctx: CommandContext) -> OutboundMessage:
+    """Mark a task with a new status: /task mark <task_id> <status>"""
     raw_args = ctx.args.strip().split(None, 1)
     if len(raw_args) < 2:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content="Usage: /task status <task_id> <status>",
+            content="Usage: /task mark <task_id> <status>  (todo, doing, done, blocked)",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
     task_id, status = raw_args[0], raw_args[1].strip().lower()
@@ -702,7 +661,7 @@ async def cmd_task_status(ctx: CommandContext) -> OutboundMessage:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content="Invalid status. Valid statuses are: todo, doing, done, blocked.",
+            content="Invalid status. Valid values: todo, doing, done, blocked.",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
     store = TaskTreeStore(ctx.loop.workspace)
@@ -717,7 +676,34 @@ async def cmd_task_status(ctx: CommandContext) -> OutboundMessage:
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content=f"Updated task `{task.id}` to status `{task.status}`.",
+        content=f"Marked task `{task.id}` as `{task.status}`.",
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_task_status(ctx: CommandContext) -> OutboundMessage:
+    """Query the status of a task: /task status <task_id>"""
+    task_id = ctx.args.strip()
+    if not task_id:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /task status <task_id>",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    store = TaskTreeStore(ctx.loop.workspace)
+    task = store.get_task(task_id)
+    if not task:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Task `{task_id}` not found.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Task `{task.id}` ({task.title}): **{task.status}**",
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
 
@@ -729,7 +715,7 @@ async def cmd_task_update(ctx: CommandContext) -> OutboundMessage:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content="Usage: /task update <task_id> [--title <title>] [--description <desc>] [--status <status>] [--parent <parent_id>]",
+            content="Usage: /task update <task_id> [--title <title>] [--description <desc>] [--status <status>]",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
 
@@ -737,7 +723,7 @@ async def cmd_task_update(ctx: CommandContext) -> OutboundMessage:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content="Please provide at least one field to update: --title, --description, --status, or --parent.",
+            content="Please provide at least one field to update: --title, --description, or --status.",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
 
@@ -759,30 +745,6 @@ async def cmd_task_update(ctx: CommandContext) -> OutboundMessage:
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
 
-    if updates["parent_id"]:
-        parent_id = updates["parent_id"]
-        if parent_id == task_id:
-            return OutboundMessage(
-                channel=ctx.msg.channel,
-                chat_id=ctx.msg.chat_id,
-                content="A task cannot be its own parent.",
-                metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-            )
-        if store.is_descendant(parent_id, task_id):
-            return OutboundMessage(
-                channel=ctx.msg.channel,
-                chat_id=ctx.msg.chat_id,
-                content="Cannot move a task under its own descendant.",
-                metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-            )
-        if not store.get_task(parent_id):
-            return OutboundMessage(
-                channel=ctx.msg.channel,
-                chat_id=ctx.msg.chat_id,
-                content=f"Parent task `{parent_id}` not found.",
-                metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-            )
-
     updated = store.update_task(task_id, **{k: v for k, v in updates.items() if v is not None})
     if not updated:
         return OutboundMessage(
@@ -801,36 +763,34 @@ async def cmd_task_update(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_task_children(ctx: CommandContext) -> OutboundMessage:
-    task_id = ctx.args.strip()
-    if not task_id:
-        return await cmd_task_help(ctx)
-    store = TaskTreeStore(ctx.loop.workspace)
-    task = store.get_task(task_id)
-    if not task:
-        content = f"Task `{task_id}` not found."
-    else:
-        children = store.get_children(task_id)
-        if not children:
-            content = f"Task `{task_id}` has no direct children."
-        else:
-            lines = [f"Children of `{task.id}` {task.title}:"]
-            lines.extend([f"- `{child.id}` {child.title} [{child.status}]" for child in children])
-            content = "\n".join(lines)
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=content,
-        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
-    )
-
-
 async def cmd_task_tree(ctx: CommandContext) -> OutboundMessage:
-    task_id = ctx.args.strip() or None
+    """Show task tree. Supports optional task_id root and --depth <n> to limit levels."""
+    raw = ctx.args.strip()
+    max_depth: int | None = None
+
+    # Parse optional --depth <n>
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+    remaining: list[str] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] == "--depth" and i + 1 < len(tokens):
+            try:
+                max_depth = int(tokens[i + 1])
+            except ValueError:
+                pass
+            i += 2
+            continue
+        remaining.append(tokens[i])
+        i += 1
+    task_id = remaining[0] if remaining else None
+
     store = TaskTreeStore(ctx.loop.workspace)
-    content = store.build_task_tree(task_id)
+    content = store.build_task_tree(task_id, max_depth=max_depth)
     if content is None:
-        content = f"Task `{ctx.args.strip()}` not found."
+        content = f"Task `{task_id}` not found."
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -871,17 +831,79 @@ async def cmd_task_move(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_task_delete(ctx: CommandContext) -> OutboundMessage:
-    task_id = ctx.args.strip()
+    """Delete a task. Use --cascade to delete all descendants, --orphan to re-parent them."""
+    raw = ctx.args.strip()
+    cascade = False
+    orphan = False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+    remaining: list[str] = []
+    for tok in tokens:
+        if tok == "--cascade":
+            cascade = True
+        elif tok == "--orphan":
+            orphan = True
+        else:
+            remaining.append(tok)
+    task_id = remaining[0] if remaining else ""
+
     if not task_id:
         return await cmd_task_help(ctx)
+
     store = TaskTreeStore(ctx.loop.workspace)
     task = store.get_task(task_id)
     if not task:
-        content = f"Task `{task_id}` not found."
-    elif store.delete_task(task_id):
-        content = f"Deleted task `{task_id}`. Its direct children are now orphaned."
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Task `{task_id}` not found.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
+    children = store.get_children(task_id)
+    if children and not cascade and not orphan:
+        child_list = ", ".join(f"`{c.id}`" for c in children)
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=(
+                f"Task `{task_id}` has {len(children)} child task(s): {child_list}.\n"
+                "Use `--orphan` to delete and orphan children, or `--cascade` to delete all descendants."
+            ),
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
+    def _unbind_task_sessions(tid: str) -> None:
+        """Clear task_id from all sessions bound to this task."""
+        for session_key in store.get_bound_sessions(tid):
+            try:
+                session = ctx.loop.sessions.get_or_create(session_key)
+                if session.metadata.get("task_id") == tid:
+                    session.metadata.pop("task_id", None)
+                    ctx.loop.sessions.save(session)
+            except Exception:
+                pass
+
+    if cascade:
+        def _delete_recursive(tid: str) -> None:
+            for child in store.get_children(tid):
+                _delete_recursive(child.id)
+            _unbind_task_sessions(tid)
+            store.delete_task(tid)
+        _delete_recursive(task_id)
+        content = f"Deleted task `{task_id}` and all its descendants."
     else:
-        content = f"Failed to delete task `{task_id}`."
+        _unbind_task_sessions(task_id)
+        if store.delete_task(task_id):
+            content = (
+                f"Deleted task `{task_id}`. Its children are now orphaned (no parent)."
+                if orphan else f"Deleted task `{task_id}`."
+            )
+        else:
+            content = f"Failed to delete task `{task_id}`."
+
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -904,27 +926,29 @@ def build_help_text() -> str:
         "/export-context [filename] — Export current session context to a Markdown file",
         "",
         "Task commands:",
-        "/task — Show task command help",
-        "/task create [--parent <parent_id>] <title> | <description> — Create a new task",
-        "/task update <task_id> [--title <title>] [--description <desc>] [--status <status>] [--parent <parent_id>] — Update a task",
-        "/task status <task_id> <status> — Update task status (todo, doing, done, blocked)",
+        "/task — Show current bound task (or help)",
+        "/task create [--parent <id>] <title> | <desc> — Create a new task",
+        "/task update <id> [--title] [--description] [--status] — Update task fields",
+        "/task mark <id> <status> — Set task status (todo, doing, done, blocked)",
+        "/task status <id> — Query task status",
         "/task list [status] — List tasks, optionally filtered by status",
-        "/task show <task_id> — Show a task's details",
-        "/task tree [<task_id>] — Show the task tree or subtree",
-        "/task children <task_id> — Show direct children of a task",
-        "/task move <task_id> <parent_id> — Move a task under a new parent",
-        "/task delete <task_id> — Delete a task and orphan its children",
-        "/task memory add <task_id> | <content> — Add a task-specific memory entry",
-        "/task memory view <task_id> — View task-specific memory entries",
-        "/task memory update <task_id> <entry_id> | <new_content> — Update a memory entry",
-        "/task memory delete <task_id> <entry_id> — Delete a memory entry",
-        "/task attach <task_id> — Attach this session to a task",
-        "/task detach — Detach the current task from this session",
+        "/task show <id> — Show a task's details",
+        "/task tree [<id>] [--depth <n>] — Show task tree",
+        "/task move <id> <parent_id> — Move a task under a new parent",
+        "/task delete <id> [--cascade|--orphan] — Delete a task",
+        "/task memory add <id> | <content> — Add a task memory entry",
+        "/task memory list <id> — List task memory entries",
+        "/task memory update <id> <entry_id> | <new_content> — Update a memory entry",
+        "/task memory delete <id> <entry_id> — Delete a memory entry",
         "",
         "Session commands:",
         "/session list — List all sessions",
+        "/session create [title] — Create a new session (no switch)",
+        "/session new [title] — Create and switch to a new session",
         "/session switch <name> — Switch to an existing session",
-        "/session new [name] — Create and switch to a new session",
+        "/session rename [target] <new_title> — Rename a session",
+        "/session bind <task_id> — Bind current session to a task",
+        "/session unbind — Unbind current session from its task",
         "",
         "/help — Show available commands",
     ]
@@ -972,7 +996,13 @@ async def cmd_session_list(ctx: CommandContext) -> OutboundMessage:
             task_id = s.metadata.get("task_id")
             if task_id:
                 task = store.get_task(task_id)
-                task_label = f" → {task.title} ({task_id})" if task else f" → task:{task_id}"
+                if task:
+                    task_label = f" → {task.title} ({task_id})"
+                else:
+                    # Task was deleted; clean up the dangling reference
+                    s.metadata.pop("task_id", None)
+                    loop.sessions.save(s)
+                    task_label = ""
             else:
                 task_label = ""
             current_marker = " <当前会话>" if is_current else ""
@@ -1022,8 +1052,26 @@ async def cmd_session_switch(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_session_create(ctx: CommandContext) -> OutboundMessage:
+    """Create a new session without switching to it. Optional title argument."""
+    import uuid
+    title = ctx.args.strip()
+    new_key = f"{ctx.msg.channel}:{uuid.uuid4().hex[:8]}"
+    session = ctx.loop.sessions.get_or_create(new_key)
+    if title:
+        session.title = title
+    ctx.loop.sessions.save(session)
+    label = _session_label(new_key, session.title)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Created session **{label}** (`{new_key}`). Use `/session switch {label}` to switch to it.",
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
 async def cmd_session_new(ctx: CommandContext) -> OutboundMessage:
-    """Create a new session with an auto-generated key; optional title argument."""
+    """Create a new session and immediately switch to it. Optional title argument."""
     import uuid
     title = ctx.args.strip()
     new_key = f"{ctx.msg.channel}:{uuid.uuid4().hex[:8]}"
@@ -1045,23 +1093,36 @@ async def cmd_session_new(ctx: CommandContext) -> OutboundMessage:
 
 
 async def cmd_session_rename(ctx: CommandContext) -> OutboundMessage:
-    """Rename (set title of) the current session."""
-    new_title = ctx.args.strip()
-    if not new_title:
+    """Rename a session. Usage: /session rename <new_title>  or  /session rename <target> <new_title>"""
+    raw = ctx.args.strip()
+    if not raw:
         return OutboundMessage(
             channel=ctx.msg.channel,
             chat_id=ctx.msg.chat_id,
-            content="Usage: /session rename <new_title>",
+            content="Usage: /session rename <new_title>  or  /session rename <target> <new_title>",
             metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
         )
     current_key = ctx.msg.metadata.get("_current_session_key", ctx.key) if ctx.msg.metadata else ctx.key
-    session = ctx.loop.sessions.get_or_create(current_key)
+    parts = raw.split(None, 1)
+    if len(parts) == 2:
+        # Try to resolve first token as a session target; fall back to treating full string as new title
+        candidate_key = _resolve_session(ctx, parts[0])
+        if candidate_key:
+            target_key = candidate_key
+            new_title = parts[1].strip()
+        else:
+            target_key = current_key
+            new_title = raw
+    else:
+        target_key = current_key
+        new_title = raw
+    session = ctx.loop.sessions.get_or_create(target_key)
     session.title = new_title
     ctx.loop.sessions.save(session)
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content=f"Session renamed to **{new_title}**.",
+        content=f"Session `{target_key}` renamed to **{new_title}**.",
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
 
@@ -1094,11 +1155,83 @@ async def cmd_session_delete(ctx: CommandContext) -> OutboundMessage:
         )
     session = ctx.loop.sessions.get_or_create(del_key)
     label = _session_label(del_key, session.title)
+    # Unbind from task before deleting the session
+    task_id = session.metadata.get("task_id")
+    if task_id:
+        TaskTreeStore(ctx.loop.workspace).unbind_session(task_id, del_key)
     ctx.loop.sessions.delete(del_key)
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=f"Session **{label}** deleted.",
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_session_bind(ctx: CommandContext) -> OutboundMessage:
+    """Bind the current session to a task: /session bind <task_id>"""
+    task_id = ctx.args.strip()
+    if not task_id:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /session bind <task_id>",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    store = TaskTreeStore(ctx.loop.workspace)
+    task = store.get_task(task_id)
+    if not task:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Task `{task_id}` not found.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    if not ctx.session:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Unable to bind: this command requires an active session.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    # Unbind from previous task if switching
+    old_task_id = ctx.session.metadata.get("task_id")
+    if old_task_id and old_task_id != task.id:
+        store.unbind_session(old_task_id, ctx.session.key)
+    # Bind session → task (metadata) and task → session (bound_sessions)
+    ctx.session.metadata["task_id"] = task.id
+    ctx.loop.sessions.save(ctx.session)
+    store.bind_session(task.id, ctx.session.key)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Session bound to task `{task.title}` (`{task.id}`).",
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_session_unbind(ctx: CommandContext) -> OutboundMessage:
+    """Unbind the current session from its task: /session unbind"""
+    if not ctx.session:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Unable to unbind: this command requires an active session.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    task_id = ctx.session.metadata.get("task_id")
+    if not task_id:
+        content = "No task is currently bound to this session."
+    else:
+        ctx.session.metadata.pop("task_id", None)
+        ctx.loop.sessions.save(ctx.session)
+        # Remove session from the task's bound_sessions list
+        TaskTreeStore(ctx.loop.workspace).unbind_session(task_id, ctx.session.key)
+        content = "Session unbound from task."
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
 
@@ -1158,11 +1291,14 @@ async def cmd_session_help(ctx: CommandContext) -> OutboundMessage:
         "## Session Commands",
         "",
         "/session list — List all sessions",
-        "/session new [title] — Create a new session (auto-generated key, optional title)",
+        "/session create [title] — Create a new session (no switch)",
+        "/session new [title] — Create and switch to a new session",
         "/session switch <title_or_key> — Switch to an existing session",
-        "/session rename <new_title> — Rename the current session",
-        "/session show [title_or_key] — Show session details",
+        "/session rename [target] <new_title> — Rename a session (no target = current)",
+        "/session show [title_or_key] — Show session details (no arg = current)",
         "/session delete <title_or_key> — Delete a session",
+        "/session bind <task_id> — Bind current session to a task",
+        "/session unbind — Unbind current session from its task",
     ])
     return OutboundMessage(
         channel=ctx.msg.channel,
@@ -1342,7 +1478,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
                   confirmation_required=True,
                   agent_description="Revert memory to a specific checkpoint ID.",
                   agent_parameters={"checkpoint_id": {"type": "string", "description": "Checkpoint ID to restore"}})
-    router.exact("/task", cmd_task_help)
+    router.exact("/task", cmd_task_current)
     router.exact("/task help", cmd_task_help)
     router.prefix("/task create ", cmd_task_create,
                   agent_accessible=True,
@@ -1367,9 +1503,9 @@ def register_builtin_commands(router: CommandRouter) -> None:
                   agent_parameters={
                       "args": {"type": "string", "description": "e.g. 'task_abc123 | Fixed the auth bug'", "required": True}
                   })
-    router.prefix("/task memory view ", cmd_task_memory_view,
+    router.prefix("/task memory list ", cmd_task_memory_list,
                   agent_accessible=True,
-                  agent_description="View memory entries for a task.",
+                  agent_description="List memory entries for a task.",
                   agent_parameters={"task_id": {"type": "string", "description": "Task ID", "required": True}})
     router.prefix("/task memory update ", cmd_task_memory_update,
                   agent_accessible=True,
@@ -1383,13 +1519,12 @@ def register_builtin_commands(router: CommandRouter) -> None:
                   agent_parameters={
                       "args": {"type": "string", "description": "e.g. 'task_abc mem_001'", "required": True}
                   })
-    router.prefix("/task children ", cmd_task_children,
-                  agent_accessible=True,
-                  agent_description="List direct children of a task.",
-                  agent_parameters={"task_id": {"type": "string", "description": "Task ID", "required": True}})
     router.prefix("/task tree", cmd_task_tree,
                   agent_accessible=True,
-                  agent_description="Show the task hierarchy tree. Optionally pass a root task ID.")
+                  agent_description="Show the task hierarchy tree. Optionally pass a root task ID and/or --depth <n>.",
+                  agent_parameters={
+                      "args": {"type": "string", "description": "e.g. '<task_id> --depth 2' (both optional)"},
+                  })
     router.prefix("/task move ", cmd_task_move,
                   agent_accessible=True,
                   agent_description="Move a task under a different parent.",
@@ -1400,25 +1535,30 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/task delete ", cmd_task_delete,
                   agent_accessible=True,
                   confirmation_required=True,
-                  agent_description="Delete a task. Its direct children become orphaned.",
-                  agent_parameters={"task_id": {"type": "string", "description": "Task ID to delete", "required": True}})
-    router.prefix("/task attach ", cmd_task_attach,
+                  agent_description=(
+                      "Delete a task. By default refuses if the task has children. "
+                      "Use --cascade to recursively delete all descendants, "
+                      "or --orphan to delete and leave children parentless."
+                  ),
+                  agent_parameters={
+                      "args": {"type": "string", "description": "e.g. 'task_abc123' or 'task_abc123 --cascade'", "required": True}
+                  })
+    router.prefix("/task mark ", cmd_task_mark,
                   agent_accessible=True,
-                  agent_description="Attach the current session to a task. All subsequent task memory operations bind to this task.",
-                  agent_parameters={"task_id": {"type": "string", "description": "Task ID to attach", "required": True}})
-    router.exact("/task detach", cmd_task_detach,
-                 agent_accessible=True,
-                 agent_description="Detach the current session from its bound task.")
-    router.prefix("/task status ", cmd_task_status,
-                  agent_accessible=True,
-                  agent_description="Update the status of a task.",
+                  agent_description="Set the status of a task.",
                   agent_parameters={
                       "task_id": {"type": "string", "description": "Task ID", "required": True},
                       "status": {"type": "string", "description": "New status: todo, doing, done, blocked", "required": True},
                   })
+    router.prefix("/task status ", cmd_task_status,
+                  agent_accessible=True,
+                  agent_description="Query the current status of a task (read-only).",
+                  agent_parameters={
+                      "task_id": {"type": "string", "description": "Task ID", "required": True},
+                  })
     router.prefix("/task update ", cmd_task_update,
                   agent_accessible=True,
-                  agent_description="Update task fields: --title, --description, --status, --parent.",
+                  agent_description="Update task fields: --title, --description, --status. To reparent use /task move.",
                   agent_parameters={
                       "task_id": {"type": "string", "description": "Task ID", "required": True},
                       "args": {"type": "string", "description": "e.g. '--title New Title --status done'", "required": True},
@@ -1429,14 +1569,35 @@ def register_builtin_commands(router: CommandRouter) -> None:
                  agent_description="List all sessions.")
     router.prefix("/session switch ", cmd_session_switch,
                   agent_accessible=True,
-                  agent_description="Switch to a different session by key.",
-                  agent_parameters={"session_key": {"type": "string", "description": "Session key to switch to", "required": True}})
-    router.prefix("/session new", cmd_session_new)
-    router.prefix("/session rename", cmd_session_rename)
-    router.prefix("/session delete ", cmd_session_delete)
+                  agent_description="Switch to a different session by key or title.",
+                  agent_parameters={"session_key": {"type": "string", "description": "Session key or title to switch to", "required": True}})
+    router.prefix("/session create", cmd_session_create,
+                  agent_accessible=True,
+                  agent_description="Create a new session without switching to it. Optional title.",
+                  agent_parameters={"title": {"type": "string", "description": "Optional session title"}})
+    router.prefix("/session new", cmd_session_new,
+                  agent_accessible=True,
+                  agent_description="Create a new session and immediately switch to it. Optional title.",
+                  agent_parameters={"title": {"type": "string", "description": "Optional session title"}})
+    router.prefix("/session rename", cmd_session_rename,
+                  agent_accessible=True,
+                  agent_description="Rename a session. Usage: /session rename <new_title>  or  /session rename <target> <new_title>. No target = current session.",
+                  agent_parameters={"args": {"type": "string", "description": "e.g. 'New Name' or 'old-session New Name'", "required": True}})
+    router.prefix("/session delete ", cmd_session_delete,
+                  agent_accessible=True,
+                  confirmation_required=True,
+                  agent_description="Delete a session by title or key. Cannot delete the current session.",
+                  agent_parameters={"title_or_key": {"type": "string", "description": "Session title or key to delete", "required": True}})
     router.prefix("/session show", cmd_session_show,
                   agent_accessible=True,
-                  agent_description="Show details of the current session.")
+                  agent_description="Show details of the current or specified session.")
+    router.prefix("/session bind ", cmd_session_bind,
+                  agent_accessible=True,
+                  agent_description="Bind the current session to a task. Task context will be injected into the system prompt.",
+                  agent_parameters={"task_id": {"type": "string", "description": "Task ID to bind", "required": True}})
+    router.exact("/session unbind", cmd_session_unbind,
+                 agent_accessible=True,
+                 agent_description="Unbind the current session from its task.")
     router.exact("/export-context", cmd_export_context)
     router.prefix("/export-context ", cmd_export_context)
     router.exact("/help", cmd_help)

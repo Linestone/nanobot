@@ -25,6 +25,7 @@ class TaskNode:
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
     metadata: dict[str, Any] = field(default_factory=dict)
+    bound_sessions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,6 +43,7 @@ class TaskNode:
             created_at=data.get("created_at", datetime.now().isoformat()),
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             metadata=data.get("metadata", {}),
+            bound_sessions=data.get("bound_sessions", []),
         )
 
 
@@ -185,6 +187,34 @@ class TaskTreeStore:
             lines.append(f"- [{entry['timestamp']}] ({entry['id']}) {entry['content']}")
         return "\n".join(lines)
 
+    def get_bound_sessions(self, task_id: str) -> list[str]:
+        """Return session keys currently bound to this task."""
+        task = self.get_task(task_id)
+        return list(task.bound_sessions) if task else []
+
+    def bind_session(self, task_id: str, session_key: str) -> bool:
+        """Register session_key as bound to task_id. Idempotent."""
+        tasks = self._load()
+        task = tasks.get(task_id)
+        if not task:
+            return False
+        if session_key not in task.bound_sessions:
+            task.bound_sessions.append(session_key)
+            task.updated_at = datetime.now().isoformat()
+            self._save(tasks)
+        return True
+
+    def unbind_session(self, task_id: str, session_key: str) -> bool:
+        """Remove session_key from task_id's bound list. No-op if not bound."""
+        tasks = self._load()
+        task = tasks.get(task_id)
+        if not task or session_key not in task.bound_sessions:
+            return False
+        task.bound_sessions.remove(session_key)
+        task.updated_at = datetime.now().isoformat()
+        self._save(tasks)
+        return True
+
     def is_descendant(self, task_id: str, ancestor_id: str) -> bool:
         current = self.get_task(task_id)
         while current and current.parent_id:
@@ -193,12 +223,14 @@ class TaskTreeStore:
             current = self.get_parent(current.id)
         return False
 
-    def build_task_tree(self, task_id: str | None = None) -> str | None:
-        def _render(node: TaskNode, prefix: str = "") -> list[str]:
+    def build_task_tree(self, task_id: str | None = None, max_depth: int | None = None) -> str | None:
+        def _render(node: TaskNode, prefix: str = "", depth: int = 0) -> list[str]:
             lines = [f"{prefix}- `{node.id}` {node.title} [{node.status}] ({node.task_type})"]
+            if max_depth is not None and depth >= max_depth:
+                return lines
             children = sorted(self.get_children(node.id), key=lambda t: t.title)
             for child in children:
-                lines.extend(_render(child, prefix + "  "))
+                lines.extend(_render(child, prefix + "  ", depth + 1))
             return lines
 
         if task_id:
@@ -305,4 +337,6 @@ class TaskTreeStore:
             )
         if task.description:
             lines.append(f"Description: {task.description}")
+        if task.bound_sessions:
+            lines.append("Bound Sessions: " + ", ".join(task.bound_sessions))
         return "\n".join(lines)

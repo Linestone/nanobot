@@ -55,7 +55,9 @@ class ContextBuilder:
                 "Use `/task memory add <task_id> | <content>` to add an entry, "
                 "`/task memory update <task_id> <entry_id> | <new_content>` to correct one, "
                 "`/task memory delete <task_id> <entry_id>` to remove an outdated entry, "
-                "and `/task memory view <task_id>` to inspect entries."
+                "and `/task memory list <task_id>` to inspect entries. "
+                "To update task status use `/task mark <task_id> <status>`. "
+                "To bind/unbind the session to a task use `/session bind <task_id>` or `/session unbind`."
             )
 
         memory = self.memory.get_memory_context()
