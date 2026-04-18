@@ -1568,7 +1568,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
                  agent_accessible=True,
                  agent_description="List all sessions.")
     router.prefix("/session switch ", cmd_session_switch,
-                  agent_accessible=True,
+                  agent_accessible=False,
                   agent_description="Switch to a different session by key or title.",
                   agent_parameters={"session_key": {"type": "string", "description": "Session key or title to switch to", "required": True}})
     router.prefix("/session create", cmd_session_create,

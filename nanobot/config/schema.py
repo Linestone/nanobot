@@ -211,6 +211,23 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class CLIHistoryConfig(Base):
+    """CLI session history replay configuration."""
+
+    max_messages: int | None = Field(
+        default=50,
+        description="Max messages to replay when opening/switching sessions. null = show all.",
+    )
+    show_tool_calls: bool = Field(default=False, description="Show tool-call invocations in history replay")
+    show_tool_results: bool = Field(default=False, description="Show tool-result content in history replay")
+
+
+class CLIConfig(Base):
+    """CLI-specific configuration."""
+
+    history: CLIHistoryConfig = Field(default_factory=CLIHistoryConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -220,6 +237,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    cli: CLIConfig = Field(default_factory=CLIConfig)
 
     @property
     def workspace_path(self) -> Path:

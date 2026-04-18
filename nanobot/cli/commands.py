@@ -210,6 +210,103 @@ async def _print_interactive_response(
     await run_in_terminal(_write)
 
 
+def _extract_text_content(content: Any) -> str:
+    """Extract plain text from a message content field (str or list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            item.get("text", "") for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return str(content) if content else ""
+
+
+async def _print_session_history(
+    session: Any,
+    render_markdown: bool = True,
+    show_tool_calls: bool = False,
+    show_tool_results: bool = False,
+    max_messages: int | None = 50,
+) -> None:
+    """Replay session history styled identically to live chat output.
+
+    Uses the same _render_interactive_ansi / _response_renderable / __logo__
+    pipeline as the real-time rendering path, so the output is indistinguishable.
+    """
+    import json as _json
+
+    messages = session.messages
+    if not messages:
+        return
+
+    # Build visible entries list (filter based on config).
+    visible: list[tuple[str, dict]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "user":
+            if _extract_text_content(msg.get("content")):
+                visible.append(("user", msg))
+        elif role == "assistant":
+            content = _extract_text_content(msg.get("content"))
+            tool_calls = msg.get("tool_calls") or []
+            if content or (show_tool_calls and tool_calls):
+                visible.append(("assistant", msg))
+        elif role == "tool" and show_tool_results:
+            visible.append(("tool", msg))
+
+    if not visible:
+        return
+
+    # Apply limit (counts visible entries, not raw messages).
+    truncated_notice: str | None = None
+    if max_messages is not None and len(visible) > max_messages:
+        omitted = len(visible) - max_messages
+        visible = visible[-max_messages:]
+        truncated_notice = f"  [dim]… {omitted} earlier message(s) not shown …[/dim]"
+
+    def _write() -> None:
+        def _render(c: Console) -> None:
+            if truncated_notice:
+                c.print(truncated_notice)
+            for kind, msg in visible:
+                if kind == "user":
+                    content = _extract_text_content(msg.get("content"))
+                    from rich.markup import escape as _esc
+                    c.print(f"[bold blue]You:[/bold blue] {_esc(content)}")
+                    c.print()
+                elif kind == "assistant":
+                    content = _extract_text_content(msg.get("content"))
+                    tool_calls = msg.get("tool_calls") or []
+                    if show_tool_calls:
+                        for tc in tool_calls:
+                            fn = tc.get("function", {})
+                            name = fn.get("name", "?")
+                            try:
+                                args = _json.loads(fn.get("arguments", "{}"))
+                                preview = ", ".join(
+                                    f"{k}={repr(v)[:40]}" for k, v in list(args.items())[:3]
+                                )
+                            except Exception:
+                                preview = fn.get("arguments", "")[:80]
+                            c.print(f"  [dim]↳ {name}({preview})[/dim]")
+                    if content:
+                        c.print()
+                        c.print(f"[cyan]{__logo__} nanobot[/cyan]")
+                        c.print(_response_renderable(content, render_markdown))
+                        c.print()
+                elif kind == "tool":
+                    name = msg.get("name", "tool")
+                    raw = _extract_text_content(msg.get("content"))
+                    preview = raw[:300] + ("…" if len(raw) > 300 else "")
+                    c.print(f"  [dim]↳ {name} → {preview}[/dim]")
+
+        ansi = _render_interactive_ansi(_render)
+        print_formatted_text(ANSI(ansi), end="")
+
+    await run_in_terminal(_write)
+
+
 def _print_cli_progress_line(text: str, thinking: ThinkingSpinner | None) -> None:
     """Print a CLI progress line, pausing the spinner if needed."""
     with thinking.pause() if thinking else nullcontext():
@@ -1166,6 +1263,18 @@ def agent(
             else:
                 _initial_key = await _pick_session_tui(agent_loop)
 
+            # Show history for the selected session (skip for brand-new empty sessions).
+            _initial_session = agent_loop.sessions.get_or_create(_initial_key)
+            if _initial_session.messages:
+                _h = config.cli.history
+                await _print_session_history(
+                    _initial_session,
+                    render_markdown=markdown,
+                    show_tool_calls=_h.show_tool_calls,
+                    show_tool_results=_h.show_tool_results,
+                    max_messages=_h.max_messages,
+                )
+
             # Mutable current session key — updated by _session_switch signals.
             # Using a list so the closure in _consume_outbound can mutate it.
             _current_session_key: list[str] = [_initial_key]
@@ -1201,10 +1310,20 @@ def agent(
                                 await _print_interactive_progress_line(msg.content, spinner)
                             continue
 
-                        # Handle session switch signal from commands like /task attach
+                        # Handle session switch signal from commands like /session switch
                         new_key = msg.metadata.get("_session_switch") if msg.metadata else None
                         if new_key:
                             _current_session_key[0] = new_key
+                            _switched = agent_loop.sessions.get_or_create(new_key)
+                            if _switched.messages:
+                                _h = config.cli.history
+                                await _print_session_history(
+                                    _switched,
+                                    render_markdown=markdown,
+                                    show_tool_calls=_h.show_tool_calls,
+                                    show_tool_results=_h.show_tool_results,
+                                    max_messages=_h.max_messages,
+                                )
 
                         if not turn_done.is_set():
                             if msg.content:
