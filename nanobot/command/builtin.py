@@ -402,6 +402,8 @@ def _task_help_text() -> str:
         "/task delete <task_id> — Delete a task and orphan its children",
         "/task memory add <task_id> | <content> — Add a task-specific memory entry",
         "/task memory view <task_id> — View task-specific memory entries",
+        "/task memory update <task_id> <entry_id> | <new_content> — Update a memory entry",
+        "/task memory delete <task_id> <entry_id> — Delete a memory entry",
         "/task attach <task_id> — Attach this session to a task",
         "/task detach — Detach the current task from this session",
     ]
@@ -564,6 +566,67 @@ async def cmd_task_memory_view(ctx: CommandContext) -> OutboundMessage:
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
         content=content,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_task_memory_update(ctx: CommandContext) -> OutboundMessage:
+    # Args: <task_id> <entry_id> | <new_content>
+    raw = ctx.args.strip()
+    task_id = entry_id = content = ""
+    if "|" in raw:
+        left, right = raw.split("|", 1)
+        parts = left.strip().split(None, 2)
+        task_id = parts[0] if parts else ""
+        entry_id = parts[1] if len(parts) > 1 else ""
+        content = right.strip()
+    if not task_id or not entry_id or not content:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /task memory update <task_id> <entry_id> | <new_content>",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    store = TaskTreeStore(ctx.loop.workspace)
+    if not store.update_task_memory(task_id, entry_id, content):
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Could not update entry `{entry_id}` for task `{task_id}`. Check the IDs.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Updated task memory entry `{entry_id}` for task `{task_id}`.",
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_task_memory_delete(ctx: CommandContext) -> OutboundMessage:
+    # Args: <task_id> <entry_id>
+    parts = ctx.args.strip().split(None, 2)
+    task_id = parts[0] if parts else ""
+    entry_id = parts[1] if len(parts) > 1 else ""
+    if not task_id or not entry_id:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="Usage: /task memory delete <task_id> <entry_id>",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    store = TaskTreeStore(ctx.loop.workspace)
+    if not store.delete_task_memory(task_id, entry_id):
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Could not delete entry `{entry_id}` from task `{task_id}`. Check the IDs.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=f"Deleted task memory entry `{entry_id}` from task `{task_id}`.",
         metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
     )
 
@@ -853,6 +916,8 @@ def build_help_text() -> str:
         "/task delete <task_id> — Delete a task and orphan its children",
         "/task memory add <task_id> | <content> — Add a task-specific memory entry",
         "/task memory view <task_id> — View task-specific memory entries",
+        "/task memory update <task_id> <entry_id> | <new_content> — Update a memory entry",
+        "/task memory delete <task_id> <entry_id> — Delete a memory entry",
         "/task attach <task_id> — Attach this session to a task",
         "/task detach — Detach the current task from this session",
         "",
@@ -1130,8 +1195,13 @@ def _render_message_content(content: object) -> str:
     return str(content) if content is not None else ""
 
 
-def _format_context_as_markdown(messages: list[dict], session_key: str) -> str:
+def _format_context_as_markdown(
+    messages: list[dict],
+    session_key: str,
+    tool_definitions: list[dict] | None = None,
+) -> str:
     """Format a message list (system + history) as human-readable Markdown."""
+    import json as _json
     from datetime import datetime
     lines = [
         "# Exported Context",
@@ -1142,6 +1212,21 @@ def _format_context_as_markdown(messages: list[dict], session_key: str) -> str:
         "---",
         "",
     ]
+
+    if tool_definitions:
+        lines.append("## Tools")
+        lines.append("")
+        for tool in tool_definitions:
+            name = tool.get("name") or tool.get("function", {}).get("name", "?")
+            desc = tool.get("description") or tool.get("function", {}).get("description", "")
+            lines.append(f"### `{name}`")
+            lines.append("")
+            if desc:
+                lines.append(desc)
+                lines.append("")
+        lines.append("---")
+        lines.append("")
+
     for i, msg in enumerate(messages):
         role = msg.get("role", "unknown")
         content = msg.get("content")
@@ -1210,7 +1295,8 @@ async def cmd_export_context(ctx: CommandContext) -> OutboundMessage:
         task_id=task_id,
     )
 
-    markdown = _format_context_as_markdown(messages, ctx.key)
+    tool_definitions = loop.tools.get_definitions()
+    markdown = _format_context_as_markdown(messages, ctx.key, tool_definitions=tool_definitions)
     out_path = loop.workspace / filename
     out_path.write_text(markdown, encoding="utf-8")
 
@@ -1285,6 +1371,18 @@ def register_builtin_commands(router: CommandRouter) -> None:
                   agent_accessible=True,
                   agent_description="View memory entries for a task.",
                   agent_parameters={"task_id": {"type": "string", "description": "Task ID", "required": True}})
+    router.prefix("/task memory update ", cmd_task_memory_update,
+                  agent_accessible=True,
+                  agent_description="Update a task memory entry. Format: <task_id> <entry_id> | <new_content>",
+                  agent_parameters={
+                      "args": {"type": "string", "description": "e.g. 'task_abc mem_001 | Corrected content'", "required": True}
+                  })
+    router.prefix("/task memory delete ", cmd_task_memory_delete,
+                  agent_accessible=True,
+                  agent_description="Delete a task memory entry by ID.",
+                  agent_parameters={
+                      "args": {"type": "string", "description": "e.g. 'task_abc mem_001'", "required": True}
+                  })
     router.prefix("/task children ", cmd_task_children,
                   agent_accessible=True,
                   agent_description="List direct children of a task.",

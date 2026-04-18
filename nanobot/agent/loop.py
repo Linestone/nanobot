@@ -29,12 +29,6 @@ from nanobot.agent.tools.run_command import RunCommandTool
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.task_memory import (
-    TaskMemoryAddTool,
-    TaskMemoryDeleteTool,
-    TaskMemoryListTool,
-    TaskMemoryUpdateTool,
-)
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -295,10 +289,6 @@ class AgentLoop:
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
-        self.tools.register(TaskMemoryAddTool(self.workspace))
-        self.tools.register(TaskMemoryUpdateTool(self.workspace))
-        self.tools.register(TaskMemoryDeleteTool(self.workspace))
-        self.tools.register(TaskMemoryListTool(self.workspace))
         self.tools.register(RunCommandTool(router=self.commands, loop=self))
         if self.cron_service:
             self.tools.register(
@@ -342,10 +332,6 @@ class AgentLoop:
                         tool.set_context(channel, chat_id, message_id)
                     else:
                         tool.set_context(channel, chat_id)
-        for name in ("task_memory_add", "task_memory_update", "task_memory_delete", "task_memory_list"):
-            if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(task_id)
         if tool := self.tools.get("run_command"):
             if hasattr(tool, "set_context"):
                 tool.set_context(

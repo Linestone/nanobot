@@ -50,10 +50,12 @@ class ContextBuilder:
             if task_memory:
                 parts.append(f"# Current Task Memory\n\n{task_memory}")
             parts.append(
-                "# Task Memory Tools\n"
-                "If you identify a new stable fact or useful detail for this task, use the available task memory tools. "
-                "Use `task_memory_add` to add a new memory entry, `task_memory_update` to correct an existing entry, "
-                "`task_memory_delete` to remove an outdated entry, and `task_memory_list` to inspect entries."
+                "# Task Memory\n"
+                "If you identify a new stable fact or useful detail for this task, use the `run_command` tool to manage task memory. "
+                "Use `/task memory add <task_id> | <content>` to add an entry, "
+                "`/task memory update <task_id> <entry_id> | <new_content>` to correct one, "
+                "`/task memory delete <task_id> <entry_id>` to remove an outdated entry, "
+                "and `/task memory view <task_id>` to inspect entries."
             )
 
         memory = self.memory.get_memory_context()
